@@ -18,8 +18,6 @@ This project is still very much work-in-progress.
 
 ## Engine setup
 
-### Using git
-
 Firstly, download this repository onto your computer. 
 
 ```
@@ -46,25 +44,10 @@ Then choose a binary to run!
 
 > **Project layout:** Rust binaries live in `src/rust/src/bin/` and are auto-discovered by Cargo. Data folders (`nets/`, `games/`, `hidden/`, `python_client_games/`, `experiment_nets/`, `frames/`) live at the **project root** (`TrueZero/`) and are resolved automatically — both the Rust code (`tzrust::data_path()`) and the Python code (`src/python/paths.py`) anchor paths to the project root, so you can run everything from any working directory.
 
-### Using Docker
-
-Alternately, you can use Docker to set up this project for training. This assumes that you are using Linux Ubuntu to train since the base Docker Image uses Ubuntu. 
-
-Firstly, run
-
-```
-docker pull andreaslam/tz
-```
-You may need to change your directory and locate this project.
-```
-cd ..
-cd app
-```
-
 ## Setting environment variables
 
 
-Set the following environment variables to configure `tch-rs` before running anything. This assumes you use PyTorch version 2.1 to use and set up. Use a [virtual environment if neeeded](https://docs.python.org/3/library/venv.html). 
+Set the following environment variables to configure `tch-rs` before running anything. This assumes you are using at least PyTorch version 2.1 to use and set up. Use a [virtual environment if neeeded](https://docs.python.org/3/library/venv.html). 
 
 ```
 export LIBTORCH_USE_PYTORCH=1
@@ -77,7 +60,6 @@ On Windows, it's
 $env:LIBTORCH_USE_PYTORCH=1
 $PYTORCH_PATH = python -c "import torch; print(torch.__path__[0])"
 $env:PATH = "$PYTORCH_PATH\lib;$env:PATH"
-$env:LIBTORCH_BYPASS_VERSION_CHECK=1
 ```
 
 ## Running Data Generation and Training
@@ -128,7 +110,7 @@ challenges, or starts self-play. After that barrier, self-play and Lichess
 game handling run concurrently; later networks are loaded by the same
 executor while both data sources continue operating.
 
-Executor and generator counts can be overridden without changing the binary:
+Executor and generator counts can be overridden without changing the binary (available for Lichess binary only for now):
 
 ```powershell
 $env:TZ_NUM_EXECUTORS = "2"
@@ -162,19 +144,17 @@ cargo run --bin ucimain --release
 
 The engine loads its network from `nets/` at the project root. The compiled binaries (in `src/rust/target/release/`) can also be launched directly from any directory.
 
-## What each file does
-
-### Internal Engine testing (non-UCI compliant)
+## Internal Engine testing (non-UCI compliant)
 - `getdecode.rs` - used for obtaining the encoded NN inputs.
 - `getmove.rs` - used for obtaining a single tree search.
 - `getgame.rs` - used for obtaining a game.
 - `getinferencetime.rs` - used for benchmarking inference times and batching effectiveness through calculating the nodes/s.
 
-### External Engine testing (UCI compliant)
+## External Engine testing (UCI compliant)
 - `uci.rs` - contains code for UCI implementation. Code modified from JW's [monty](https://github.com/official-monty/monty) engine
 - `ucimain.rs` - used for running games using UCI.
 
-### Source code for the Engine
+## Source code for the Engine
 - `boardmanager.rs` - a wrapper for the cozy-chess library. Manages and handles draw conditions, such as fifty-move repetition, threefold repetition and must-draw scenarios.
 - `cache.rs` - contains abstractions for the cache key.
 - `dataformat.rs` - contains necessary abstractions for `fileformat.rs`.
