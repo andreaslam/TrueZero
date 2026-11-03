@@ -32,8 +32,8 @@ COPY src/rust/Cargo.toml src/rust/Cargo.lock src/rust/
 COPY src/rust /opt/truezero/src/rust
 RUN --mount=type=cache,target=/root/.cargo/registry \
     --mount=type=cache,target=/root/.cargo/git \
-    --mount=type=cache,target=/opt/truezero/src/rust/target \
     cargo build --manifest-path src/rust/Cargo.toml --release --locked --bins
+COPY src/python /opt/truezero/src/python
 
 FROM nvidia/cuda:${CUDA_VERSION}-cudnn8-runtime-ubuntu22.04 AS runtime
 
