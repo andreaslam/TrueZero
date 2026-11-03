@@ -97,7 +97,7 @@ impl Net {
     pub fn new_with_device_id(path: &str, id: usize) -> Self {
         let device = requested_device(Some(id));
         let device = if let Device::Cuda(device_id) = device {
-            let id = if Cuda::device_count() <= device_id {
+            let id = if Cuda::device_count() <= (device_id as i64) {
                 0
             } else {
                 device_id
