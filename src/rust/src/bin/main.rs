@@ -80,8 +80,11 @@ fn main() {
         std::process::exit(1);
     }));
 
+    let server_host = env::var("TZ_SERVER_HOST").unwrap_or_else(|_| "127.0.0.1".to_string());
+    let server_port = env::var("TZ_SERVER_PORT").unwrap_or_else(|_| "38475".to_string());
+    let server_addr = format!("{server_host}:{server_port}");
     let mut stream = loop {
-        match TcpStream::connect("127.0.0.1:38475") {
+        match TcpStream::connect(&server_addr) {
             Ok(s) => break s,
             Err(_) => continue,
         }

@@ -1,0 +1,48 @@
+services:
+  truezero:
+    container_name: truezero
+    image: ${TRUEZERO_IMAGE:-ghcr.io/andreaslam/truezero:latest}
+    build:
+      context: .
+      dockerfile: Dockerfile
+    command: ["${TZ_COMMAND:-ucimain}"]
+    environment:
+      TZ_DATA_ROOT: /data
+      TZ_DEVICE: ${TZ_DEVICE:-cuda}
+      TZ_MODEL_PATH: ${TZ_MODEL_PATH:-/data/nets/tz_0.pt}
+      RUST_BACKTRACE: "1"
+      LICHESS_API_KEY: ${LICHESS_API_KEY:-}
+    ports:
+      - "${TRUEZERO_PORT:-38475}:38475"
+    volumes:
+      - ${TRUEZERO_DATA_DIR:-./.truezero-data}:/data
+    gpus: ${GPU_COUNT:-all}
+    init: true
+    restart: "no"
+  server:
+    extends:
+      service: truezero
+    container_name: truezero-server
+    command: ["server"]
+    ports:
+      - "${TRUEZERO_PORT:-38475}:38475"
+  selfplay:
+    extends:
+      service: truezero
+    container_name: truezero-selfplay
+    command: ["main"]
+    depends_on:
+      - server
+    environment:
+      TZ_SERVER_HOST: server
+      TZ_SERVER_PORT: "38475"
+  training:
+    extends:
+      service: truezero
+    container_name: truezero-training
+    command: ["python", "src/python/client.py"]
+    depends_on:
+      - server
+    environment:
+      TZ_SERVER_HOST: server
+      TZ_SERVER_PORT: "38475"

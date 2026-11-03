@@ -93,8 +93,8 @@ def load_file(games_path):
     return DataFile.open(game, games_path)
 
 
-HOST = "127.0.0.1"
-PORT = 38475
+HOST = os.environ.get("TZ_SERVER_HOST", "127.0.0.1")
+PORT = int(os.environ.get("TZ_SERVER_PORT", "38475"))
 
 BUFFER_SIZE = 1500000
 BATCH_SIZE = 2048

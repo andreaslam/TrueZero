@@ -42,6 +42,14 @@ cargo build --release
 
 Then choose a binary to run!
 
+## Docker deployment
+
+TrueZero has a reproducible CUDA/LibTorch container workflow for local,
+NVIDIA GPU, and HPC deployments. It builds and tests automatically on pushes
+to `main`, publishing successful images to GHCR. See
+[`DOCKER.md`](DOCKER.md) for prerequisites, persistent model storage, GPU
+execution, one-command updates, rollback, and Slurm/Apptainer usage.
+
 > **Project layout:** Rust binaries live in `src/rust/src/bin/` and are auto-discovered by Cargo. Data folders (`nets/`, `games/`, `hidden/`, `python_client_games/`, `experiment_nets/`, `frames/`) live at the **project root** (`TrueZero/`) and are resolved automatically — both the Rust code (`tzrust::data_path()`) and the Python code (`src/python/paths.py`) anchor paths to the project root, so you can run everything from any working directory.
 
 ## Setting environment variables

@@ -54,17 +54,40 @@ pub struct Net {
     pub device: Device,
 }
 
+fn requested_device(id: Option<usize>) -> Device {
+    maybe_init_cuda();
+    let requested = std::env::var("TZ_DEVICE").unwrap_or_else(|_| "auto".to_string());
+    match requested.to_ascii_lowercase().as_str() {
+        "cpu" => Device::Cpu,
+        "cuda" => {
+            if !has_cuda() {
+                panic!("TZ_DEVICE=cuda was requested, but CUDA is unavailable");
+            }
+            Device::Cuda(id.unwrap_or(0))
+        }
+        "mps" => {
+            if !has_mps() {
+                panic!("TZ_DEVICE=mps was requested, but MPS is unavailable");
+            }
+            Device::Mps
+        }
+        "auto" => {
+            if has_cuda() {
+                Device::Cuda(id.unwrap_or(0))
+            } else if has_mps() {
+                Device::Mps
+            } else {
+                Device::Cpu
+            }
+        }
+        value => panic!("Unsupported TZ_DEVICE={value}; use auto, cpu, cuda, or mps"),
+    }
+}
+
 impl Net {
     /// creates a new `Net` instance by loading a model from the specified path
     pub fn new(path: &str) -> Self {
-        maybe_init_cuda();
-        let device = if has_cuda() {
-            Device::Cuda(0)
-        } else if has_mps() {
-            Device::Mps
-        } else {
-            Device::Cpu
-        };
+        let device = requested_device(None);
         let mut net = tch::CModule::load_on_device(path, device).expect("ERROR");
         net.set_eval();
 
@@ -72,18 +95,16 @@ impl Net {
     }
     /// creates a new `Net` instance with a specified device ID (supports only CUDA)
     pub fn new_with_device_id(path: &str, id: usize) -> Self {
-        maybe_init_cuda();
-        let device = if has_cuda() {
-            let id = if Cuda::device_count() <= id.try_into().unwrap() {
+        let device = requested_device(Some(id));
+        let device = if let Device::Cuda(device_id) = device {
+            let id = if Cuda::device_count() <= device_id {
                 0
             } else {
-                id
+                device_id
             };
             Device::Cuda(id)
-        } else if has_mps() {
-            Device::Mps
         } else {
-            Device::Cpu
+            device
         };
         // let device = Device::Cpu;
         let mut net = tch::CModule::load_on_device(path, device).expect("ERROR");

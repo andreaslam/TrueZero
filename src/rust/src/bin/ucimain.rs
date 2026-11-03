@@ -3,7 +3,7 @@ use tzrust::{data_path_str, uci::run_uci};
 
 fn main() {
     env::set_var("RUST_BACKTRACE", "1");
-    run_uci(&data_path_str(
-        r"C:\Users\andre\RemoteFolder\TrueZero\nets\tz_1.pt",
-    ));
+    let model_path = env::var("TZ_MODEL_PATH")
+        .unwrap_or_else(|_| data_path_str("nets/tz_0.pt"));
+    run_uci(&model_path);
 }

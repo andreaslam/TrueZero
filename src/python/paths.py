@@ -16,9 +16,10 @@ Use ``data_path("nets/tz_0.pt")`` anywhere so scripts work regardless of the
 current working directory.
 """
 
+import os
 from pathlib import Path
 
-ROOT = Path(__file__).resolve().parents[2]
+ROOT = Path(os.environ.get("TZ_DATA_ROOT", Path(__file__).resolve().parents[2]))
 
 
 def data_path(rel: str) -> str:

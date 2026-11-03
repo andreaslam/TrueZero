@@ -1,3 +1,4 @@
 --extra-index-url https://download.pytorch.org/whl/cu121
+numpy==1.26.4
 torch==2.8.0
 setuptools==83.0.0
