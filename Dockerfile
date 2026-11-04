@@ -43,7 +43,7 @@ ENV DEBIAN_FRONTEND=noninteractive \
     TZ_DATA_ROOT=/data \
     TZ_DEVICE=auto \
     TZ_MODEL_PATH=/data/nets/tz_0.pt \
-    LD_LIBRARY_PATH=/opt/libtorch/lib:/usr/local/cuda/lib64 \
+    LD_LIBRARY_PATH=/opt/venv/lib/python3.10/site-packages/torch/lib:/usr/local/cuda/lib64 \
     RUST_BACKTRACE=1
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -57,7 +57,6 @@ RUN groupadd --gid ${APP_GID} truezero && \
 
 COPY --from=builder /opt/truezero/src/rust/target/release/ /opt/truezero/bin/
 COPY --from=builder /opt/venv /opt/venv
-COPY --from=builder /opt/venv/lib/python3.10/site-packages/torch/lib/ /opt/libtorch/lib/
 COPY --from=builder /opt/truezero/src/python /opt/truezero/src/python
 COPY docker/entrypoint.sh /usr/local/bin/truezero
 
