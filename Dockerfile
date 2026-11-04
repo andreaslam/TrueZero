@@ -46,12 +46,17 @@ ENV DEBIAN_FRONTEND=noninteractive \
     LD_LIBRARY_PATH=/opt/libtorch/lib:/usr/local/cuda/lib64 \
     RUST_BACKTRACE=1
 
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    python3 \
+    && rm -rf /var/lib/apt/lists/*
+
 RUN groupadd --gid ${APP_GID} truezero && \
     useradd --uid ${APP_UID} --gid ${APP_GID} --create-home --shell /usr/sbin/nologin truezero && \
     mkdir -p /opt/truezero/bin /opt/libtorch/lib /data && \
     chown -R truezero:truezero /opt/truezero /data
 
 COPY --from=builder /opt/truezero/src/rust/target/release/ /opt/truezero/bin/
+COPY --from=builder /opt/venv /opt/venv
 COPY --from=builder /opt/venv/lib/python3.10/site-packages/torch/lib/ /opt/libtorch/lib/
 COPY --from=builder /opt/truezero/src/python /opt/truezero/src/python
 COPY docker/entrypoint.sh /usr/local/bin/truezero
