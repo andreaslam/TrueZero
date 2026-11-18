@@ -8,4 +8,4 @@ pyqtgraph==0.12.4
 scipy==1.11.4
 torch==2.14.0
 torchvision==0.29.0
-setuptools==83.0.0
+setuptools==84.1.0
