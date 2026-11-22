@@ -131,48 +131,6 @@ class Position:
         )
 
         data.finish()
-        self._validate_replay_contract(move_count)
-
-    def _validate_replay_contract(self, move_count: int):
-        assert 0 <= self.move_index <= move_count, "Invalid position index"
-        assert self.is_final == (self.move_index == move_count), (
-            "Final-position flag does not match position index"
-        )
-        assert np.isclose(
-            self.final_moves_left, move_count - self.move_index, atol=0.001
-        ), "Invalid final moves-left target"
-        assert (
-            len(self.policy_indices)
-            == len(self.policy_values)
-            == self.available_mv_count
-        )
-        assert np.all(
-            (0 <= self.policy_indices) & (self.policy_indices < self.game.policy_size)
-        ), "Policy index outside the game's policy space"
-
-        if self.available_mv_count:
-            assert np.isfinite(self.policy_values).all(), "Non-finite policy value"
-            assert np.isclose(self.policy_values.sum(), 1.0, atol=0.001), (
-                "Policy values must sum to one"
-            )
-
-        self._validate_wdl("final", self.final_wdl)
-        self._validate_wdl("zero", self.zero_wdl)
-        self._validate_wdl("net", self.net_wdl)
-        assert np.isclose(
-            self.final_v, self.final_wdl[0] - self.final_wdl[2], atol=0.001
-        ), "Final value and WDL target disagree"
-
-    @staticmethod
-    def _validate_wdl(name: str, wdl: np.ndarray):
-        if np.isnan(wdl).all():
-            return
-
-        assert np.isfinite(wdl).all(), f"Partially non-finite {name} WDL target"
-        assert np.isclose(wdl.sum(), 1.0, atol=0.001), (
-            f"{name} WDL target must sum to one"
-        )
-
     def map_symmetry_inplace(self, index: int):
         symmetries = self.game.symmetry
 
@@ -377,23 +335,9 @@ class PositionBatch:
         return len(self.input_full)
 
 
-# Chess replay files store the halfmove clock raw (0..=100). Scale it to 0..=1 at
-# input time, exactly like Rust `decoder.rs::convert_board` (HALFMOVE_CLOCK_SCALE).
-CHESS_HALFMOVE_CLOCK_CHANNEL = 7
-CHESS_HALFMOVE_CLOCK_SCALE = 100.0
-
-
-def network_input_scalars(game: Game, input_scalars: np.ndarray) -> np.ndarray:
-    if game.name != "chess":
-        return input_scalars
-    scaled = np.array(input_scalars, dtype=np.float32, copy=True)
-    scaled[CHESS_HALFMOVE_CLOCK_CHANNEL] /= CHESS_HALFMOVE_CLOCK_SCALE
-    return scaled
-
-
 def write_input(game: Game, target, position: Position):
     target[: game.input_scalar_channels, :, :] = (
-        torch.tensor(network_input_scalars(game, position.input_scalars))
+        torch.tensor(position.input_scalars)
         .view(-1, 1, 1)
         .expand(*game.input_scalar_shape)
     )

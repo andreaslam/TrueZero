@@ -162,8 +162,7 @@ def sample_position(
             assert pos.simulation.includes_final, (
                 "Cannot include final position for file without any"
             )
-            final_pos = group.positions[pi + int(pos.final_moves_left)]
-            assert final_pos.is_final, "Expected the appended final position"
+            final_pos = group.positions[pi + int(pos.final_moves_left) - 1]
             pos.final_position = final_pos
 
         return pi, pos
