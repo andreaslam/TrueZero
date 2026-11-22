@@ -137,8 +137,14 @@ pub fn board_data(bs: &BoardStack) -> (Vec<f32>, Vec<bool>) {
 
 // expand scalar and board data into the network input tensor
 
+/// the halfmove clock is stored raw (0..=100) in replay files and scaled to 0..=1 only
+/// when building the network input. The Python trainer applies the same scale in
+/// `lib/data/position.py::write_input`, so old replay files stay valid.
+pub const HALFMOVE_CLOCK_SCALE: f32 = 100.0;
+
 pub fn convert_board(bs: &BoardStack) -> Tensor {
-    let (scalar_data, pieces_sqs) = board_data(bs);
+    let (mut scalar_data, pieces_sqs) = board_data(bs);
+    scalar_data[7] /= HALFMOVE_CLOCK_SCALE;
 
     let mut all_data = Vec::with_capacity(21 * 64);
 

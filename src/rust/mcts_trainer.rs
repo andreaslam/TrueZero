@@ -697,6 +697,13 @@ impl Node {
         }
     }
 
+    /// root settings (FPU, c_puct) apply when choosing among the root's children.
+    /// PUCT is evaluated on the child being scored, so "root" means "parent is the root"
+    /// (index 0 in `Tree.nodes`). The root itself (parent `None`) is never scored by PUCT.
+    fn is_root_or_root_child(&self) -> bool {
+        matches!(self.parent, None | Some(0))
+    }
+
     pub fn get_q_val(&self, settings: SearchSettings, relative_evaluation: ZeroValuesPov) -> f32 {
         let fpu = settings.fpu;
         if self.visits > 0 {
@@ -706,17 +713,19 @@ impl Node {
             };
             total / (self.visits as f32)
         } else {
-            match self.parent {
-                Some(_) => fpu.children_fpu,
-                None => fpu.root_fpu,
+            if self.is_root_or_root_child() {
+                fpu.root_fpu
+            } else {
+                fpu.children_fpu
             }
         }
     }
 
     pub fn get_u_val(&self, parent_visits: u32, settings: SearchSettings) -> f32 {
-        let c_puct = match self.parent {
-            Some(_) => settings.c_puct.children_c_puct,
-            None => settings.c_puct.root_c_puct,
+        let c_puct = if self.is_root_or_root_child() {
+            settings.c_puct.root_c_puct
+        } else {
+            settings.c_puct.children_c_puct
         };
 
         c_puct * self.policy * ((parent_visits - 1) as f32).sqrt() / (1.0 + self.visits as f32)

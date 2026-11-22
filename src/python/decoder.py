@@ -12,7 +12,7 @@ Coordinate / perspective contract (see ENGINE_SEMANTIC_SPEC.md):
 - The en-passant plane uses the same square rotation.
 - Castling scalar channels are ordered us (long, short) then opponent (long,
   short). Channel 0/1 are white-to-move / black-to-move indicators, channel 6
-  is the repetition count, channel 7 the halfmove clock.
+  is the repetition count, channel 7 the halfmove clock divided by 100.
 - Policy indices live in the fixed White-absolute 1880-move space defined by
   `src/mvs.rs`. Black moves are rank-flipped (mirror, not rotation) before
   lookup, exactly like the Rust `extract_policy`.
@@ -94,7 +94,7 @@ def convert_board(board, bigl=None):
 
     # repetition count of the current position + halfmove clock
     scalars[6] = float(_repetition_count(board))
-    scalars[7] = float(board.halfmove_clock)
+    scalars[7] = float(board.halfmove_clock) / 100.0  # Rust HALFMOVE_CLOCK_SCALE
 
     # --- piece planes ----------------------------------------------------
     planes = torch.zeros(13, 8, 8)

@@ -4,7 +4,11 @@ from unittest.mock import patch
 
 import torch
 
+import numpy as np
+
+from lib.data.position import write_input
 from lib.data.sampler import sample_position
+from lib.games import Game
 from lib.train import _masked_mean, evaluate_policy
 
 
@@ -46,6 +50,21 @@ class ReplayContractTests(unittest.TestCase):
 
         self.assertEqual(_masked_mean(values, terminal).item(), 3.0)
 
+
+    def test_chess_halfmove_clock_is_scaled_at_input_time_only(self):
+        game = Game.find("chess")
+        scalars = np.array([1, 0, 1, 1, 1, 1, 1, 50], dtype=np.float32)
+        position = SimpleNamespace(
+            input_scalars=scalars,
+            input_bools=np.zeros(game.input_bool_shape, dtype=np.uint8),
+        )
+        target = torch.empty(game.full_input_shape)
+
+        write_input(game, target, position)
+
+        self.assertEqual(target[7, 0, 0].item(), 0.5)  # 50 / 100, like Rust convert_board
+        self.assertEqual(target[6, 0, 0].item(), 1.0)  # repetitions untouched
+        self.assertEqual(scalars[7], 50.0)  # stored replay value is not mutated
 
 if __name__ == "__main__":
     unittest.main()

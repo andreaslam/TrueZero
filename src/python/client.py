@@ -251,8 +251,8 @@ def main():
     train_settings = TrainSettings(
         game=game,
         scalar_target=ScalarTarget.Final,
-        value_weight=0.1,
-        wdl_weight=0.1,
+        value_weight=1.0,
+        wdl_weight=1.0,
         moves_left_weight=0.1,
         moves_left_delta=0.1,
         policy_weight=1,
