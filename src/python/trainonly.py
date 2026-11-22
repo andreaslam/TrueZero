@@ -3,7 +3,7 @@ import os
 
 import network as network
 import torch
-from lib.data.file import DataFile
+from kzero_data import open_data_file
 from lib.games import Game
 from lib.logger import Logger
 from lib.loop import LoopBuffer
@@ -14,9 +14,7 @@ from tqdm import tqdm
 
 
 def load_file(games_path: str):
-    game = Game.find("chess")
-    data = DataFile.open(game, games_path)
-    return data
+    return open_data_file(games_path)
 
 
 game = Game.find("chess")
@@ -86,7 +84,8 @@ if data_paths:
         try:
             data = load_file(file)
             loopbuf.append(None, data)
-        except Exception:
+        except Exception as e:
+            print(f"[Warning] skipping replay file {file}: {e}")
             continue
     if os.path.exists(LOG_EXPERIMENT_PATH):
         try:

@@ -651,4 +651,52 @@ mod tests {
     fn mated_root_is_loss_for_white() {
         assert_mated_root_is_loss("6k1/8/8/8/8/8/5PPP/r5K1 w - - 1 1");
     }
+
+    // ---- end to end: real TorchScript network -> self-play -> KZero data file ----
+    //
+    // Opt-in, because it needs a TorchScript net on disk. From src/python:
+    //   python -c "import torch, network; torch.jit.save(torch.jit.script(network.TrueNetXS(num_resBlocks=1, num_hidden=8)).eval(), '/tmp/tz_e2e.pt')"
+    //   TZ_E2E_NET=/tmp/tz_e2e.pt TZ_E2E_OUT=/tmp/tz_e2e_games cargo test --lib -- --ignored selfplay_with_a_real_network
+    // then load `TZ_E2E_OUT` with `kzero_data.open_data_file` and train on it.
+    #[test]
+    #[ignore]
+    fn selfplay_with_a_real_network_writes_a_kzero_file() {
+        use crate::executor::{executor_static, Message};
+        use crate::fileformat::BinaryOutput;
+        use crate::mcts_trainer::TypeRequest::TrainerSearch;
+        use crate::selfplay::{CollectorMessage, DataGen};
+
+        let net = std::env::var("TZ_E2E_NET").expect("TZ_E2E_NET");
+        let out = std::env::var("TZ_E2E_OUT").expect("TZ_E2E_OUT");
+
+        let (tensor_send, tensor_recv) = flume::bounded::<Packet>(1);
+        let (ctrl_send, ctrl_recv) = flume::bounded::<Message>(1);
+        let (nps_send, _nps_recv) = flume::unbounded::<CollectorMessage>();
+        let executor = std::thread::spawn(move || executor_static(net, tensor_recv, ctrl_recv, 1));
+
+        let mut settings = stub_search_settings();
+        settings.search_type = TrainerSearch(None);
+        settings.max_nodes = Some(8);
+        let mut cache = LruCache::new(NonZeroUsize::new(1000).unwrap());
+        let mut output = BinaryOutput::new(&out, "chess").unwrap();
+        let datagen = DataGen { iterations: 1 };
+        for game in 0..2 {
+            let simulation = futures::executor::block_on(datagen.play_game(
+                &tensor_send,
+                &nps_send,
+                &settings,
+                game,
+                &mut cache,
+                None,
+                None,
+            ));
+            assert!(!simulation.positions.is_empty());
+            output.append(&simulation).unwrap();
+        }
+        output.finish().unwrap();
+
+        ctrl_send.send(Message::StopServer).unwrap();
+        drop(tensor_send);
+        executor.join().unwrap();
+    }
 }

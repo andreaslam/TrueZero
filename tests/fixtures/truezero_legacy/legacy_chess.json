@@ -1,0 +1,52 @@
+{
+  "game": "chess",
+  "input_bool_shape": [
+    13,
+    8,
+    8
+  ],
+  "input_scalar_count": 8,
+  "policy_shape": [
+    1880
+  ],
+  "game_count": 7,
+  "position_count": 54,
+  "includes_terminal_positions": true,
+  "includes_game_start_indices": true,
+  "max_game_length": 15,
+  "min_game_length": 3,
+  "root_wdl": [
+    0.0,
+    5.0,
+    2.0
+  ],
+  "hit_move_limit": 0.71428573,
+  "scalar_names": [
+    "game_id",
+    "pos_index",
+    "game_length",
+    "zero_visits",
+    "is_full_search",
+    "is_final_position",
+    "is_terminal",
+    "hit_move_limit",
+    "available_mv_count",
+    "played_mv",
+    "kdl_policy",
+    "final_v",
+    "final_wdl_w",
+    "final_wdl_d",
+    "final_wdl_l",
+    "final_moves_left",
+    "zero_v",
+    "zero_wdl_w",
+    "zero_wdl_d",
+    "zero_wdl_l",
+    "zero_moves_left",
+    "net_v",
+    "net_wdl_w",
+    "net_wdl_d",
+    "net_wdl_l",
+    "net_moves_left"
+  ]
+}

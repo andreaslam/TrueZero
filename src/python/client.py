@@ -10,7 +10,7 @@ import time
 
 import network as network
 import torch
-from lib.data.file import DataFile
+from kzero_data import open_data_file
 from lib.games import Game
 from lib.logger import Logger
 from lib.loop import LoopBuffer
@@ -89,8 +89,7 @@ def model_weights_checksum(model):
 
 
 def load_file(games_path):
-    game = Game.find("chess")
-    return DataFile.open(game, games_path)
+    return open_data_file(games_path)
 
 
 HOST = os.environ.get("TZ_SERVER_HOST", "127.0.0.1")
@@ -575,7 +574,8 @@ def extract_incoming_data_given_bytes(
 
     data_dir("python_client_games")
 
-    path = data_path(f"python_client_games/temp_games_{int(time.time())}")
+    # nanoseconds: two files arriving within the same second must not overwrite each other
+    path = data_path(f"python_client_games/temp_games_{time.time_ns()}")
 
     with open(path + ".bin", "wb") as file:
         file.write(bin_data)
@@ -1131,7 +1131,8 @@ def load_previous_data(
                     data,
                 )
 
-            except Exception:
+            except Exception as e:
+                print(f"[Warning] skipping replay file {file}: {e}")
                 continue
 
     if os.path.exists(LOG_NPZ_PATH):
