@@ -84,6 +84,18 @@ impl BoardStack {
         &self.board
     }
 
+    /// Winner of a finished game, or `None` for a draw or an ongoing game.
+    ///
+    /// Invariant: at a `Won` terminal the side to move is the checkmated side,
+    /// so the winner is the other colour. This does not depend on how many
+    /// plies were played or on which colour moved first in the opening.
+    pub fn winner(&self) -> Option<Color> {
+        match self.status() {
+            GameStatus::Won => Some(!self.board.side_to_move()),
+            GameStatus::Drawn | GameStatus::Ongoing => None,
+        }
+    }
+
     pub fn status(&self) -> GameStatus {
         let is_all_gone = self.board.occupied().len() == 2;
 
@@ -97,5 +109,18 @@ impl BoardStack {
         } else {
             self.board.status()
         }
+    }
+}
+
+/// Which of two engines moves in a match game.
+///
+/// Engine 0 plays White when `engine0_white`, otherwise Black. The choice is
+/// made from the side to move, never from a ply counter, so it stays correct
+/// for openings with Black to move.
+pub fn engine_index(side_to_move: Color, engine0_white: bool) -> usize {
+    if (side_to_move == Color::White) == engine0_white {
+        0
+    } else {
+        1
     }
 }

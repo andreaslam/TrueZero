@@ -101,6 +101,28 @@ pub fn time_to_nodes(
     (time, nodes)
 }
 
+/// Visit limit for a UCI `go` command.
+///
+/// Invariant: an explicit `go nodes N` is honoured. When a clock or
+/// `movetime` is also given, the stricter of the two limits applies; with no
+/// limit at all the default from `time_to_nodes` (1600) is used.
+pub fn go_visit_limit(
+    explicit_nodes: Option<u128>,
+    side_to_move: Color,
+    times: [Option<u64>; 2],
+    incs: [Option<u64>; 2],
+    movestogo: u64,
+    max_time: Option<u128>,
+) -> u128 {
+    let (_, timed_nodes) = time_to_nodes(side_to_move, times, incs, movestogo, max_time);
+    let has_clock = times.iter().any(|t| t.is_some()) || max_time.is_some();
+    match explicit_nodes {
+        Some(n) if has_clock => n.min(timed_nodes).max(1),
+        Some(n) => n.max(1),
+        None => timed_nodes,
+    }
+}
+
 pub fn run_uci(net_path: &str) {
     panic::set_hook(Box::new(|panic_info| {
         eprintln!("Panic occurred: {:?}", panic_info);
@@ -242,17 +264,9 @@ fn uci_command_parse_loop(
                 let mut move_probs: Vec<(Move, f32)> = legal_moves
                     .iter()
                     .zip(pol_probs.iter())
-                    .map(|(mv, p)| {
-                        let mut mv = *mv;
-                        if bs.board().side_to_move() == Color::Black {
-                            mv = Move {
-                                from: mv.from.flip_rank(),
-                                to: mv.to.flip_rank(),
-                                promotion: mv.promotion,
-                            };
-                        }
-                        (check_castling_move_on_output(&bs, mv), *p)
-                    })
+                    // extract_policy returns moves in board coordinates
+                    // (only the policy index is rank-flipped for Black).
+                    .map(|(mv, p)| (check_castling_move_on_output(&bs, *mv), *p))
                     .collect();
                 move_probs.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
                 println!("policy:");
@@ -413,7 +427,7 @@ fn handle_go(
 
     let mut finite_search = true;
 
-    let mut nodes = 1600;
+    let mut explicit_nodes: Option<u128> = None;
     let mut max_time = None;
     let mut max_depth = 256;
 
@@ -444,8 +458,8 @@ fn handle_go(
                     );
                 }
                 "nodes" => {
-                    nodes = cmd.parse().unwrap_or(nodes);
-                    debug_print!("{}", &format!("Debug: Set 'nodes' to {}", nodes));
+                    explicit_nodes = cmd.parse().ok().or(explicit_nodes);
+                    debug_print!("{}", &format!("Debug: Set 'nodes' to {:?}", explicit_nodes));
                 }
                 "movetime" => {
                     max_time = cmd.parse().ok();
@@ -481,9 +495,14 @@ fn handle_go(
     }
     debug_print!("mode: {}", mode);
 
-    let (_time, nodes) = time_to_nodes(bs.board().side_to_move(), times, incs, movestogo, max_time);
-
-    debug_print!("time left: {:?}", _time);
+    let nodes = go_visit_limit(
+        explicit_nodes,
+        bs.board().side_to_move(),
+        times,
+        incs,
+        movestogo,
+        max_time,
+    );
 
     let m_settings = MovesLeftSettings {
         moves_left_weight: 0.03,
