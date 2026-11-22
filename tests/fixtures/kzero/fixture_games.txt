@@ -1,0 +1,7 @@
+startpos | f2f3 e7e5 g2g4 d8h4
+startpos | e2e4 a7a6 e4e5 d7d5 e5d6 c7c5 g1f3 b8c6 f1e2 g8f6 e1g1 h7h5 h2h4 e8d7 a2a3
+8/1P5k/8/8/8/8/7p/K7 w - - 0 1 | b7b8n h2h1q a1a2 h7g6
+startpos | g1f3 g8f6 f3g1 f6g8 g1f3 g8f6 f3g1
+r3k2r/pppppppp/8/8/8/8/PPPPPPPP/R3K2R b KQkq - 0 1 | e8c8 e1g1 a7a5 b2b4 a5b4 a1b1
+startpos | h2h4 a7a5 h1h3 a8a6 h3h1 a6a8 e2e4 g8f6
+rnbqkbnr/pppppppp/8/8/8/5P2/PPPPP1PP/RNBQKBNR b KQkq - 0 1 | e7e5 g2g4 d8h4
