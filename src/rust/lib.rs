@@ -273,6 +273,30 @@ mod tests {
         )
     }
 
+    /// root FPU and c_puct must apply to the root's children, children settings deeper down
+    #[test]
+    fn test_root_settings_apply_to_root_children() {
+        let mut settings = create_search_settings();
+        settings.fpu = FPUSettings {
+            root_fpu: 0.7,
+            children_fpu: -0.3,
+        };
+        settings.c_puct = CPUCTSettings {
+            root_c_puct: 4.0,
+            children_c_puct: 1.0,
+        };
+        let root_child = Node::new(0.5, Some(0), None);
+        let deeper_child = Node::new(0.5, Some(5), None);
+
+        // parent_visits = 1 makes U = 0, so PUCT is exactly the FPU
+        assert_eq!(root_child.puct_formula(1, 2.0, Color::White, settings), 0.7);
+        assert_eq!(deeper_child.puct_formula(1, 2.0, Color::White, settings), -0.3);
+
+        // U = c_puct * P * sqrt(parent_visits - 1) / (1 + visits) = c_puct * 0.5 * 2
+        assert_eq!(root_child.get_u_val(5, settings), 4.0);
+        assert_eq!(deeper_child.get_u_val(5, settings), 1.0);
+    }
+
     #[test]
     fn test_backup_adds_no_extra_move_at_evaluated_node() {
         let board_stack = create_board_stack();

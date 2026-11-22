@@ -377,9 +377,23 @@ class PositionBatch:
         return len(self.input_full)
 
 
+# Chess replay files store the halfmove clock raw (0..=100). Scale it to 0..=1 at
+# input time, exactly like Rust `decoder.rs::convert_board` (HALFMOVE_CLOCK_SCALE).
+CHESS_HALFMOVE_CLOCK_CHANNEL = 7
+CHESS_HALFMOVE_CLOCK_SCALE = 100.0
+
+
+def network_input_scalars(game: Game, input_scalars: np.ndarray) -> np.ndarray:
+    if game.name != "chess":
+        return input_scalars
+    scaled = np.array(input_scalars, dtype=np.float32, copy=True)
+    scaled[CHESS_HALFMOVE_CLOCK_CHANNEL] /= CHESS_HALFMOVE_CLOCK_SCALE
+    return scaled
+
+
 def write_input(game: Game, target, position: Position):
     target[: game.input_scalar_channels, :, :] = (
-        torch.tensor(position.input_scalars)
+        torch.tensor(network_input_scalars(game, position.input_scalars))
         .view(-1, 1, 1)
         .expand(*game.input_scalar_shape)
     )
