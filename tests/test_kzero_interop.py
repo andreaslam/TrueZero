@@ -2,23 +2,21 @@
 
 `fixtures/kzero/kzero_chess.*` was written by kZero's `BinaryOutput` with `ChessStdMapper`
 (kZero commit 5bf3343, generator in `write_fixture.rs.txt`) from `fixture_games.txt`.
-`fixtures/truezero_legacy/legacy_chess.*` holds the same games written by TrueZero's writer
-before KZero compatibility was restored (commit 1c83ad6). Run from `src/python`:
+Run from `src/python`:
 
     PYTHONPATH=. python -m unittest discover -s ../../tests
 """
 
-import json
 import os
 import random
-import tempfile
 import unittest
 from pathlib import Path
 
 import numpy as np
 import torch
 
-import kzero_data
+from lib.data.file import DataFile
+from lib.games import Game
 import network
 from lib.data.check import check_data_file
 from lib.data.group import DataGroup
@@ -34,39 +32,17 @@ except ImportError:
 
 FIXTURES = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fixtures")
 KZERO = os.path.join(FIXTURES, "kzero", "kzero_chess")
-LEGACY = os.path.join(FIXTURES, "truezero_legacy", "legacy_chess")
 GAMES = os.path.join(FIXTURES, "kzero", "fixture_games.txt")
-KDL_SCALAR = kzero_data.S["kdl_policy"]
-
-
-def read_records(path):
-    """Per position: (scalars + inputs as bytes, sorted (policy index, value) pairs)."""
-    off = Path(path + ".off").read_bytes()
-    meta = json.loads(Path(path + ".json").read_text())
-    count = meta["position_count"]
-    offsets = list(np.frombuffer(off, np.uint64, count).astype(int))
-    data = Path(path + ".bin").read_bytes()
-    bounds = offsets + [len(data)]
-    head_len = 4 * len(kzero_data.SCALAR_NAMES) + kzero_data.BOOL_BYTES + 4 * 8
-    result = []
-    for start, end in zip(bounds, bounds[1:]):
-        head = bytearray(data[start : start + head_len])
-        n = (end - start - head_len) // 8
-        indices = np.frombuffer(data, np.int32, n, start + head_len)
-        values = np.frombuffer(data, np.float32, n, start + head_len + 4 * n)
-        result.append((head, sorted(zip(indices.tolist(), values.tolist()))))
-    return result
 
 
 class KZeroFileTests(unittest.TestCase):
     def setUp(self):
-        self.file = kzero_data.open_data_file(KZERO)
+        self.file = DataFile.open(Game.find("chess"), KZERO)
 
     def tearDown(self):
         self.file.close()
 
     def test_inherited_checker_accepts_file(self):
-        self.assertEqual(kzero_data.detect_layout(self.file), "kzero")
         check_data_file(self.file)
 
     def test_sampler_attaches_the_appended_final_position(self):
@@ -131,7 +107,7 @@ class PythonEncoderTests(unittest.TestCase):
     def test_inputs_and_policy_indices_match_kzero(self):
         import decoder
 
-        file = kzero_data.open_data_file(KZERO)
+        file = DataFile.open(Game.find("chess"), KZERO)
         pi = 0
         try:
             for line in Path(GAMES).read_text().splitlines():
@@ -164,45 +140,6 @@ class PythonEncoderTests(unittest.TestCase):
         finally:
             file.close()
         self.assertEqual(pi, len(file.positions))
-
-
-class LegacyMigrationTests(unittest.TestCase):
-    def test_legacy_file_is_refused(self):
-        with self.assertRaises(kzero_data.LegacyDataError):
-            kzero_data.open_data_file(LEGACY)
-
-    def test_migration_reproduces_the_kzero_file(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            out = os.path.join(tmp, "migrated")
-            kzero_data.migrate_legacy_file(LEGACY, out)
-
-            self.assertEqual(
-                Path(out + ".off").read_bytes(), Path(KZERO + ".off").read_bytes()
-            )
-            migrated = read_records(out)
-            expected = read_records(KZERO)
-            self.assertEqual(len(migrated), len(expected))
-
-            for pi, (m, e) in enumerate(zip(migrated, expected)):
-                head_m, policy_m = m
-                head_e, policy_e = e
-                # kdl_policy cannot be recovered: legacy files store NaN
-                k = slice(4 * KDL_SCALAR, 4 * KDL_SCALAR + 4)
-                self.assertTrue(np.isnan(np.frombuffer(head_m[k], np.float32)[0]))
-                head_m[k] = head_e[k]
-                self.assertEqual(head_m, head_e, f"position {pi}")
-                # (index, value) pairs are stored in move-generator order, which differs per crate
-                self.assertEqual(policy_m, policy_e, f"position {pi}")
-
-            self.assertEqual(
-                json.loads(Path(out + ".json").read_text()),
-                json.loads(Path(KZERO + ".json").read_text()),
-            )
-
-    def test_migration_refuses_a_kzero_file(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            with self.assertRaises(kzero_data.LegacyDataError):
-                kzero_data.migrate_legacy_file(KZERO, os.path.join(tmp, "x"))
 
 
 if __name__ == "__main__":

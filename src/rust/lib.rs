@@ -657,7 +657,7 @@ mod tests {
     // Opt-in, because it needs a TorchScript net on disk. From src/python:
     //   python -c "import torch, network; torch.jit.save(torch.jit.script(network.TrueNetXS(num_resBlocks=1, num_hidden=8)).eval(), '/tmp/tz_e2e.pt')"
     //   TZ_E2E_NET=/tmp/tz_e2e.pt TZ_E2E_OUT=/tmp/tz_e2e_games cargo test --lib -- --ignored selfplay_with_a_real_network
-    // then load `TZ_E2E_OUT` with `kzero_data.open_data_file` and train on it.
+    // then load `TZ_E2E_OUT` with `lib.data.file.DataFile.open` and train on it.
     #[test]
     #[ignore]
     fn selfplay_with_a_real_network_writes_a_kzero_file() {

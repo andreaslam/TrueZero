@@ -10,7 +10,7 @@ import time
 
 import network as network
 import torch
-from kzero_data import open_data_file
+from lib.data.file import DataFile
 from lib.games import Game
 from lib.logger import Logger
 from lib.loop import LoopBuffer
@@ -89,7 +89,7 @@ def model_weights_checksum(model):
 
 
 def load_file(games_path):
-    return open_data_file(games_path)
+    return DataFile.open(Game.find("chess"), games_path)
 
 
 HOST = os.environ.get("TZ_SERVER_HOST", "127.0.0.1")

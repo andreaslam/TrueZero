@@ -3,7 +3,7 @@ import os
 
 import network as network
 import torch
-from kzero_data import open_data_file
+from lib.data.file import DataFile
 from lib.games import Game
 from lib.logger import Logger
 from lib.loop import LoopBuffer
@@ -14,7 +14,7 @@ from tqdm import tqdm
 
 
 def load_file(games_path: str):
-    return open_data_file(games_path)
+    return DataFile.open(Game.find("chess"), games_path)
 
 
 game = Game.find("chess")
