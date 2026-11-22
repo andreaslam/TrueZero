@@ -7,12 +7,15 @@ probabilities over the legal moves.
 Coordinate / perspective contract (see ENGINE_SEMANTIC_SPEC.md):
 - Piece planes: first 6 are the side to move ("us"), next 6 the opponent,
   each ordered pawn, knight, bishop, rook, queen, king.
-- If Black is to move, every board square is rotated 180 degrees
-  (flat index i -> 63 - i); White to move keeps physical squares.
-- The en-passant plane uses the same square rotation.
-- Castling scalar channels are ordered us (long, short) then opponent (long,
-  short). Channel 0/1 are white-to-move / black-to-move indicators, channel 6
-  is the repetition count, channel 7 the halfmove clock divided by 100.
+- If Black is to move, ranks are flipped (flat index i -> i ^ 56, a mirror,
+  not a rotation); White to move keeps physical squares. This is KZero's
+  `ChessStdMapper` encoding, which the replay files use.
+- The en-passant plane marks the double-pushed pawn's square, only when a
+  pawn of the side to move stands next to it (KZero / `chess` crate rule).
+- Castling scalar channels are ordered us (kingside, queenside) then opponent
+  (kingside, queenside). Channel 0/1 are white-to-move / black-to-move
+  indicators, channel 6 is the repetition count, channel 7 the raw halfmove
+  clock (the network scales it internally, see `network.scale_input`).
 - Policy indices live in the fixed White-absolute 1880-move space defined by
   `src/mvs.rs`. Black moves are rank-flipped (mirror, not rotation) before
   lookup, exactly like the Rust `extract_policy`.
@@ -22,23 +25,27 @@ import math
 import os
 
 import chess
+import numpy as np
 import torch
 
 # ---------------------------------------------------------------------------
-# Move table (mirror `src/mvs.rs` CONTENTS_COZY exactly, via `list.txt`)
+# Move table: KZero's 1880-move flat policy (`lib/mapping`, same order as `src/mvs.rs`)
 # ---------------------------------------------------------------------------
 
 
 def _load_move_list():
-    """Load the 1880-entry White-absolute move list from `list.txt`.
+    """Build the 1880-entry move list from KZero's `chess_flat_to_move_input.txt`.
 
-    `list.txt` holds the exact ordered move strings (UCI) matching
-    `src/mvs.rs` CONTENTS_COZY, one per line. Promotions carry a trailing
-    piece letter (q/r/b/n).
+    Columns are (from, to, _, queen, rook, bishop, knight, no promotion), in the side to
+    move's point of view. This is the same ordering as `src/mvs.rs` CONTENTS_COZY.
     """
-    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "list.txt")
-    with open(path, encoding="utf-8") as f:
-        moves = [chess.Move.from_uci(line.strip()) for line in f if line.strip()]
+    from lib.mapping.mapping import CHESS_FLAT_TO_MOVE_INPUT
+
+    promotions = [chess.QUEEN, chess.ROOK, chess.BISHOP, chess.KNIGHT, None]
+    moves = []
+    for row in CHESS_FLAT_TO_MOVE_INPUT:
+        (kind,) = np.nonzero(row[3:8])[0]
+        moves.append(chess.Move(int(row[0]), int(row[1]), promotion=promotions[kind]))
     return moves
 
 
@@ -86,15 +93,15 @@ def convert_board(board, bigl=None):
     else:
         scalars[1] = 1.0
 
-    # castling rights, us first then opponent (long then short)
-    scalars[2] = 1.0 if board.has_queenside_castling_rights(us) else 0.0
-    scalars[3] = 1.0 if board.has_kingside_castling_rights(us) else 0.0
-    scalars[4] = 1.0 if board.has_queenside_castling_rights(opponent) else 0.0
-    scalars[5] = 1.0 if board.has_kingside_castling_rights(opponent) else 0.0
+    # castling rights, us first then opponent (kingside then queenside)
+    scalars[2] = 1.0 if board.has_kingside_castling_rights(us) else 0.0
+    scalars[3] = 1.0 if board.has_queenside_castling_rights(us) else 0.0
+    scalars[4] = 1.0 if board.has_kingside_castling_rights(opponent) else 0.0
+    scalars[5] = 1.0 if board.has_queenside_castling_rights(opponent) else 0.0
 
     # repetition count of the current position + halfmove clock
     scalars[6] = float(_repetition_count(board))
-    scalars[7] = float(board.halfmove_clock) / 100.0  # Rust HALFMOVE_CLOCK_SCALE
+    scalars[7] = float(board.halfmove_clock)
 
     # --- piece planes ----------------------------------------------------
     planes = torch.zeros(13, 8, 8)
@@ -103,19 +110,15 @@ def convert_board(board, bigl=None):
         for piece in PIECE_ORDER:
             for sq in board.pieces(piece, color):
                 if us == chess.BLACK:
-                    sq = 63 - sq  # 180-degree rotation for Black to move
+                    sq ^= 56  # rank flip for Black to move
                 planes[counter, sq // 8, sq % 8] = 1.0
             counter += 1
 
     # --- en-passant plane ------------------------------------------------
-    # Mirrors Rust: White to move marks the victim square on Rank::Fourth
-    # (rank index 3); Black to move marks Rank::Fifth (rank index 4) and
-    # applies the same 180-degree rotation as the piece planes.
-    if board.ep_square is not None:
-        if us == chess.WHITE:
-            ep_sq = chess.square(chess.square_file(board.ep_square), 3)
-        else:
-            ep_sq = 63 - chess.square(chess.square_file(board.ep_square), 4)
+    ep_sq = _capturable_en_passant_pawn(board)
+    if ep_sq is not None:
+        if us == chess.BLACK:
+            ep_sq ^= 56
         planes[12, ep_sq // 8, ep_sq % 8] = 1.0
 
     # scalars are broadcast across the board and placed before the bool planes
@@ -127,6 +130,22 @@ def convert_board(board, bigl=None):
     if bigl is None:
         bigl = torch.tensor([])
     return tensor, bigl
+
+
+def _capturable_en_passant_pawn(board):
+    """Square of the pawn that just double-pushed, if a pawn of the side to move
+    stands next to it (pins ignored), else None. Mirrors Rust `capturable_en_passant`.
+    """
+    if board.ep_square is None:
+        return None
+    pawn = board.ep_square - 8 if board.turn == chess.WHITE else board.ep_square + 8
+    file, rank = chess.square_file(pawn), chess.square_rank(pawn)
+    for df in (-1, 1):
+        if 0 <= file + df < 8:
+            piece = board.piece_at(chess.square(file + df, rank))
+            if piece == chess.Piece(chess.PAWN, board.turn):
+                return pawn
+    return None
 
 
 def _repetition_count(board):

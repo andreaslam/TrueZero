@@ -1,5 +1,5 @@
 use bytemuck::cast_slice;
-use cozy_chess::{Color, GameStatus, Move};
+use cozy_chess::{Color, GameStatus};
 use serde::Serialize;
 use std::{
     cmp::{max, min},
@@ -11,7 +11,7 @@ use std::{
 use crate::{
     boardmanager::BoardStack,
     dataformat::{Position, Simulation, ZeroValuesPov},
-    decoder::board_data,
+    decoder::{board_data, extract_policy, policy_index},
     mcts_trainer::Wdl,
     mvs::get_contents,
 };
@@ -148,14 +148,12 @@ impl BinaryOutput {
             GameStatus::Ongoing => None,
         }; // colour (if any) that won the game
 
+        // KZero: `outcome.pov(start_board.next_player())`, i.e. from the point of view of the
+        // player to move in the first position, not White.
+        let root_pov = simulation.start_board().board().side_to_move();
         match winner {
-            Some(player) => {
-                if player == Color::White {
-                    self.total_root_wdl[0] += 1;
-                } else {
-                    self.total_root_wdl[2] += 1;
-                }
-            }
+            Some(player) if player == root_pov => self.total_root_wdl[0] += 1,
+            Some(_) => self.total_root_wdl[2] += 1,
             None => self.total_root_wdl[1] += 1,
         }
 
@@ -173,23 +171,12 @@ impl BinaryOutput {
             let (available_mv_count, policy_indices) = collect_policy_indices(board);
             assert_eq!(available_mv_count, zero_evaluation.policy.len());
             assert_eq!(available_mv_count, net_evaluation.policy.len());
-            let mut played_mv = played_mv;
-            if board.board().side_to_move() == Color::Black {
-                played_mv = Move {
-                    from: played_mv.from.flip_rank(),
-                    to: played_mv.to.flip_rank(),
-                    promotion: played_mv.promotion,
-                };
-            }
-            // get all idx from mvs.rs
-            let all_idx = get_contents();
-
-            let played_mv_index = all_idx.iter().position(|&x| x == played_mv).unwrap();
-
-            // let played_mv_index = self.mapper.move_to_index(board, played_mv);
-            // let kdl_policy = kdl_divergence(&zero_evaluation.policy, &net_evaluation.policy);
-            let kdl_policy = f32::NAN;
-            let moves_left = game_length as f32 - pos_index as f32;
+            let played_mv_index = policy_index(board, played_mv, get_contents());
+            let kdl_policy = kdl_divergence(&zero_evaluation.policy, &net_evaluation.policy);
+            // KZero convention (kz-selfplay binary_output.rs): non-final positions store
+            // `game_length + 1 - pos_index` and the appended final position stores 0. The inherited
+            // sampler relies on this: the final position is at `pi + final_moves_left - 1`.
+            let moves_left = (game_length + 1 - pos_index) as f32;
             let stored_policy = &zero_evaluation.policy;
             let final_values = final_values_pov(winner, board.board().side_to_move(), moves_left);
 
@@ -321,11 +308,10 @@ impl BinaryOutput {
             includes_game_start_indices: true,
             max_game_length: self.max_game_length.unwrap_or(-1),
             min_game_length: self.min_game_length.unwrap_or(-1),
-            root_wdl: [
-                self.total_root_wdl[0] as f32,
-                self.total_root_wdl[1] as f32,
-                self.total_root_wdl[2] as f32,
-            ],
+            // KZero stores the mean root WDL over the games in this file, not raw counts.
+            root_wdl: self
+                .total_root_wdl
+                .map(|count| count as f32 / self.game_count as f32),
             hit_move_limit: self.hit_move_limit_count as f32 / self.game_count as f32,
         };
 
@@ -391,32 +377,18 @@ fn final_values_pov(
 fn collect_policy_indices(board: &BoardStack) -> (usize, Vec<u32>) {
     match board.status() {
         GameStatus::Ongoing => {
-            let mut policy_indices: Vec<u32> = vec![];
-
-            let mut move_list = Vec::new();
-            board.board().generate_moves(|moves| {
-                // Unpack dense move set into move list
-                move_list.extend(moves);
-                false
-            });
-
-            let mv_l = get_contents();
-            for m in move_list.clone() {
-                let mut fm = m;
-                if board.board().side_to_move() == Color::Black {
-                    fm = Move {
-                        from: m.from.flip_rank(),
-                        to: m.to.flip_rank(),
-                        promotion: m.promotion,
-                    };
-                }
-                policy_indices.push(mv_l.iter().position(|&x| x == fm).unwrap() as u32);
-            }
-
+            let (_, indices) = extract_policy(board, get_contents());
+            let policy_indices: Vec<u32> = indices.into_iter().map(|i| i as u32).collect();
             (policy_indices.len(), policy_indices)
         }
         GameStatus::Drawn | GameStatus::Won => (0, vec![]),
     }
+}
+
+/// Port of KZero's `kz_util::math::kdl_divergence`, including its behaviour for zero entries.
+fn kdl_divergence(p: &[f32], q: &[f32]) -> f32 {
+    assert_eq!(p.len(), q.len());
+    p.iter().zip(q).map(|(&p, &q)| p * (p / q).ln()).sum()
 }
 
 fn assert_normalized_or_nan(x: f32) {
@@ -424,7 +396,7 @@ fn assert_normalized_or_nan(x: f32) {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use cozy_chess::Board;
 
@@ -470,6 +442,201 @@ mod tests {
         assert_eq!(output.hit_move_limit_count, 1);
 
         for extension in ["bin", "off", "json", "json.tmp"] {
+            let _ = std::fs::remove_file(path.with_extension(extension));
+        }
+    }
+
+    // ---- interoperability with files written by KZero itself ----
+    //
+    // `tests/fixtures/kzero/kzero_chess.*` was written by kZero's own `BinaryOutput` with
+    // `ChessStdMapper` (kZero commit 5bf3343, see `write_fixture.rs.txt`) from the games in
+    // `fixture_games.txt`. Here TrueZero writes the same games with the same synthetic search
+    // results, and every record must match.
+
+    use crate::dataformat::{ZeroEvaluationPov, ZeroValuesPov};
+    use crate::mvs::get_contents;
+    use cozy_chess::{Move, Piece, Square};
+    use std::path::PathBuf;
+
+    const SCALAR_COUNT: usize = 26;
+    const KDL_SCALAR: usize = 10;
+    const BOOL_BYTES: usize = 13 * 64 / 8;
+    const INPUT_SCALARS: usize = 8;
+
+    fn fixture_dir() -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/kzero")
+    }
+
+    /// UCI castling (e1g1) to cozy-chess castling (king takes rook, e1h1)
+    fn parse_uci(bs: &BoardStack, s: &str) -> Move {
+        let mut mv: Move = s.parse().unwrap();
+        if bs.board().piece_on(mv.from) == Some(Piece::King) {
+            let df = mv.to.file() as i32 - mv.from.file() as i32;
+            if df.abs() == 2 {
+                let rook_file = if df > 0 {
+                    cozy_chess::File::H
+                } else {
+                    cozy_chess::File::A
+                };
+                mv.to = Square::new(rook_file, mv.from.rank());
+            }
+        }
+        mv
+    }
+
+    fn write_fixture_games(path: &Path) {
+        let games = std::fs::read_to_string(fixture_dir().join("fixture_games.txt")).unwrap();
+        let mut output = BinaryOutput::new(path, "chess").unwrap();
+        for line in games.lines().filter(|l| !l.trim().is_empty()) {
+            let (fen, moves) = line.split_once('|').unwrap();
+            let board = match fen.trim() {
+                "startpos" => Board::default(),
+                fen => Board::from_fen(fen, false).unwrap(),
+            };
+            let mut bs = BoardStack::new(board);
+            let mut positions = vec![];
+            for (i, mv_str) in moves.split_whitespace().enumerate() {
+                let mv = parse_uci(&bs, mv_str);
+                // depends only on the absolute from-square, like the KZero fixture generator
+                let (moves, _) = extract_policy(&bs, get_contents());
+                let weights: Vec<f32> = moves
+                    .iter()
+                    .map(|m| 1.0 + (m.from as usize % 7) as f32)
+                    .collect();
+                let total: f32 = weights.iter().sum();
+                let n = weights.len();
+                positions.push(Position {
+                    board: bs.clone(),
+                    is_full_search: i % 2 == 0,
+                    played_mv: mv,
+                    zero_visits: 100 + i as u64,
+                    zero_evaluation: ZeroEvaluationPov {
+                        values: ZeroValuesPov {
+                            value: 0.25,
+                            wdl: Wdl {
+                                w: 0.5,
+                                d: 0.25,
+                                l: 0.25,
+                            },
+                            moves_left: i as f32,
+                        },
+                        policy: weights.iter().map(|w| w / total).collect(),
+                    },
+                    net_evaluation: ZeroEvaluationPov {
+                        values: ZeroValuesPov {
+                            value: -0.1,
+                            wdl: Wdl {
+                                w: 0.2,
+                                d: 0.3,
+                                l: 0.5,
+                            },
+                            moves_left: 7.0,
+                        },
+                        policy: vec![1.0 / n as f32; n],
+                    },
+                });
+                bs.play(mv);
+            }
+            output
+                .append(&Simulation {
+                    positions,
+                    final_board: bs,
+                })
+                .unwrap();
+        }
+        output.finish().unwrap();
+    }
+
+    /// One position as stored on disk; `policy` is sorted by policy index.
+    pub(crate) struct Record {
+        pub(crate) scalars: Vec<f32>,
+        pub(crate) bools: Vec<u8>,
+        pub(crate) input_scalars: Vec<f32>,
+        pub(crate) policy: Vec<(u32, f32)>,
+    }
+
+    pub(crate) fn read_records(base: &Path) -> (Vec<Record>, Vec<u8>, serde_json::Value) {
+        let bin = std::fs::read(base.with_extension("bin")).unwrap();
+        let off = std::fs::read(base.with_extension("off")).unwrap();
+        let json: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(base.with_extension("json")).unwrap()).unwrap();
+        let position_count = json["position_count"].as_u64().unwrap() as usize;
+        let f32_at = |o: usize| f32::from_le_bytes(bin[o..o + 4].try_into().unwrap());
+        let u32_at = |o: usize| u32::from_le_bytes(bin[o..o + 4].try_into().unwrap());
+
+        let mut records = vec![];
+        for pi in 0..position_count {
+            let start = u64::from_le_bytes(off[pi * 8..pi * 8 + 8].try_into().unwrap()) as usize;
+            let scalars: Vec<f32> = (0..SCALAR_COUNT).map(|i| f32_at(start + 4 * i)).collect();
+            let mut o = start + 4 * SCALAR_COUNT;
+            let bools = bin[o..o + BOOL_BYTES].to_vec();
+            o += BOOL_BYTES;
+            let input_scalars: Vec<f32> = (0..INPUT_SCALARS).map(|i| f32_at(o + 4 * i)).collect();
+            o += 4 * INPUT_SCALARS;
+            let n = scalars[8] as usize;
+            let mut policy: Vec<(u32, f32)> = (0..n)
+                .map(|i| (u32_at(o + 4 * i), f32_at(o + 4 * (n + i))))
+                .collect();
+            policy.sort_by_key(|&(i, _)| i);
+            records.push(Record {
+                scalars,
+                bools,
+                input_scalars,
+                policy,
+            });
+        }
+        (records, off, json)
+    }
+
+    fn same(a: f32, b: f32, tol: f32) -> bool {
+        (a.is_nan() && b.is_nan()) || (a - b).abs() <= tol
+    }
+
+    #[test]
+    fn writes_the_same_records_as_kzero() {
+        let path =
+            std::env::temp_dir().join(format!("tzrust-kzero-interop-{}", std::process::id()));
+        write_fixture_games(&path);
+
+        let (expected, expected_off, expected_json) =
+            read_records(&fixture_dir().join("kzero_chess"));
+        let (actual, actual_off, actual_json) = read_records(&path);
+
+        assert_eq!(actual_off, expected_off, ".off files differ");
+        assert_eq!(actual_json, expected_json, ".json metadata differs");
+        assert_eq!(actual.len(), expected.len());
+
+        for (pi, (a, e)) in actual.iter().zip(&expected).enumerate() {
+            for i in 0..SCALAR_COUNT {
+                // kdl_policy sums floats in move-generation order, which differs per crate
+                let tol = if i == KDL_SCALAR { 1e-5 } else { 0.0 };
+                assert!(
+                    same(a.scalars[i], e.scalars[i], tol),
+                    "position {pi}: scalar {i} is {} but KZero wrote {}",
+                    a.scalars[i],
+                    e.scalars[i]
+                );
+            }
+            assert_eq!(a.bools, e.bools, "position {pi}: input bools differ");
+            assert_eq!(
+                a.input_scalars, e.input_scalars,
+                "position {pi}: input scalars differ"
+            );
+            assert_eq!(
+                a.policy.len(),
+                e.policy.len(),
+                "position {pi}: policy length"
+            );
+            for (&(ai, av), &(ei, ev)) in a.policy.iter().zip(&e.policy) {
+                assert_eq!(ai, ei, "position {pi}: policy indices differ");
+                assert!(
+                    same(av, ev, 1e-6),
+                    "position {pi}: policy value {av} vs {ev}"
+                );
+            }
+        }
+
+        for extension in ["bin", "off", "json"] {
             let _ = std::fs::remove_file(path.with_extension(extension));
         }
     }

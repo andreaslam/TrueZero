@@ -4,6 +4,17 @@ from torch import nn
 
 from lib.mapping.mapping import CHESS_FLAT_TO_CONV
 
+# The input follows KZero's ChessStdMapper exactly, as stored in the data files and built by
+# the Rust engine: channel 7 is the raw halfmove clock (0..=100). Scaling it is part of the
+# model, so the data files and the engine stay on the canonical KZero encoding.
+HALFMOVE_CLOCK_CHANNEL = 7
+HALFMOVE_CLOCK_SCALE = 100.0
+
+
+def scale_input(x):
+    # literals, because TorchScript cannot read the module-level constants above
+    return torch.cat([x[:, :7], x[:, 7:8] / 100.0, x[:, 8:]], dim=1)
+
 
 class TrueNet(nn.Module):
     def __init__(
@@ -52,7 +63,7 @@ class TrueNet(nn.Module):
         )
 
     def forward(self, x):
-        x = self.startBlock(x)
+        x = self.startBlock(scale_input(x))
         for block in self.backBone:
             x = block(x)
         x = self.backBoneNorm(x)
@@ -142,7 +153,7 @@ class TrueNetXS(nn.Module):
         )
 
     def forward(self, x):
-        x = self.startBlock(x)
+        x = self.startBlock(scale_input(x))
         for block in self.backBone:
             x = block(x)
         x = self.backBoneNorm(x)

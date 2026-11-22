@@ -1,4 +1,4 @@
-use cozy_chess::{Board, GameStatus};
+use cozy_chess::{Board, Color, GameStatus};
 
 use crossbeam::thread;
 
@@ -29,7 +29,7 @@ use std::{
 };
 
 use tzrust::{
-    boardmanager::BoardStack,
+    boardmanager::{engine_index, BoardStack},
     cache::CacheEntryKey,
     data_path, data_path_str,
     dataformat::ZeroEvaluationAbs,
@@ -471,18 +471,11 @@ async fn play_game(
 
     let mut bs = BoardStack::new(board);
 
-    // engine0 moves first when candidate is White.
-    //
-    // engine0_white = true:
-    //   White -> engine 0
-    //   Black -> engine 1
-    //
-    // engine0_white = false:
-    //   White -> engine 1
-    //   Black -> engine 0
-    let mut mover: usize = if engine0_white { 0 } else { 1 };
-
-    let mut plies: usize = 0;
+    // Engine 0 (the candidate) plays White when engine0_white, else Black.
+    // The engine to move is chosen from the board's side to move, so an
+    // opening with Black to move still gives engine 0 the colour recorded in
+    // GameOutcome::engine0_white.
+    let engine_for = |bs: &BoardStack| engine_index(bs.board().side_to_move(), engine0_white);
 
     let cache_0: LruCache<CacheEntryKey, ZeroEvaluationAbs> =
         LruCache::new(NonZeroUsize::new(settings.max_nodes.unwrap() as usize).unwrap());
@@ -499,6 +492,8 @@ async fn play_game(
             return None;
         }
 
+        let mover = engine_for(&bs);
+
         let engine = &engines[mover];
 
         let cache = &mut caches[mover];
@@ -512,30 +507,15 @@ async fn play_game(
         }
 
         bs.play(mv);
-
-        mover = 1 - mover;
-
-        plies += 1;
     }
 
     if bs.status() == GameStatus::Ongoing {
         return None;
     }
 
-    // At a terminal position, the side to move has either been
-    // checkmated or stalemated.
-    //
-    // plies = number of moves actually played.
-    //
-    // If plies is even, White made the last move.
-    // If plies is odd, Black made the last move.
-    let white_won: Option<bool> = match bs.status() {
-        GameStatus::Drawn => None,
-
-        GameStatus::Won => Some(plies % 2 == 0),
-
-        GameStatus::Ongoing => panic!("Game is still ongoing!"),
-    };
+    // The side to move at a Won terminal is the mated side
+    // (BoardStack::winner), independent of ply count or opening colour.
+    let white_won: Option<bool> = bs.winner().map(|c| c == Color::White);
 
     Some(GameOutcome {
         test_id,

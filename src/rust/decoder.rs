@@ -5,7 +5,7 @@ use crate::{
     mcts_trainer::{Net, Node, Tree, Wdl},
     mvs::get_contents,
 };
-use cozy_chess::{Color, Move, Piece, Square};
+use cozy_chess::{Color, File, Move, Piece, Square};
 use lru::LruCache;
 use tch::{Device, IValue, Kind, Tensor};
 
@@ -53,8 +53,34 @@ fn canonical_square(square: Square, side: Color) -> Square {
     }
 }
 
-fn canonical_move(mv: Move, side: Color) -> Move {
-    if side == Color::Black {
+/// Convert a cozy-chess move into the move KZero's `ChessStdMapper` indexes.
+///
+/// cozy-chess encodes castling as "king takes own rook" (e1h1, e1a1), whereas KZero (via the
+/// `chess` crate) encodes it as the king's two-square move (e1g1, e1c1). Without this
+/// conversion castling lands on the e1h1/e1a1 rook-move slots of the 1880-move policy.
+fn standard_move(bs: &BoardStack, mv: Move) -> Move {
+    let board = bs.board();
+    let is_castle = board.piece_on(mv.from) == Some(Piece::King)
+        && board.color_on(mv.to) == Some(board.side_to_move());
+    if !is_castle {
+        return mv;
+    }
+    let king_file = if mv.to.file() > mv.from.file() {
+        File::G
+    } else {
+        File::C
+    };
+    Move {
+        from: mv.from,
+        to: Square::new(king_file, mv.from.rank()),
+        promotion: None,
+    }
+}
+
+/// Move from the side to move's point of view: ranks are flipped for Black (KZero `move_pov`).
+fn canonical_move(bs: &BoardStack, mv: Move) -> Move {
+    let mv = standard_move(bs, mv);
+    if bs.board().side_to_move() == Color::Black {
         Move {
             from: mv.from.flip_rank(),
             to: mv.to.flip_rank(),
@@ -62,6 +88,39 @@ fn canonical_move(mv: Move, side: Color) -> Move {
         }
     } else {
         mv
+    }
+}
+
+/// Index of a legal cozy-chess move in the 1880-entry policy, identical to KZero's
+/// `ChessStdMapper::move_to_index`.
+pub fn policy_index(bs: &BoardStack, mv: Move, contents: &[Move]) -> usize {
+    let canonical_mv = canonical_move(bs, mv);
+    contents
+        .iter()
+        .position(|x| x == &canonical_mv)
+        .unwrap_or_else(|| {
+            panic!(
+                "Legal canonical move {} (actual {}) is missing \
+                 from the 1880-entry policy move list",
+                canonical_mv, mv
+            )
+        })
+}
+
+/// The double-pushed pawn's square, only when a pawn of the side to move stands next to it.
+///
+/// This matches the `chess` crate that KZero's `ChessStdMapper` reads: it records en passant
+/// only when an enemy pawn could capture (pins are not considered). cozy-chess, and therefore
+/// `BoardStack::en_passant`, reports every double push.
+fn capturable_en_passant(bs: &BoardStack) -> Option<Square> {
+    let pawn_square = bs.en_passant()?;
+    let us = bs.board().side_to_move();
+    let neighbours = pawn_square.rank().bitboard() & pawn_square.file().adjacent();
+    let capturers = bs.board().colored_pieces(us, Piece::Pawn) & neighbours;
+    if capturers.is_empty() {
+        None
+    } else {
+        Some(pawn_square)
     }
 }
 
@@ -85,12 +144,13 @@ pub fn board_data(bs: &BoardStack) -> (Vec<f32>, Vec<bool>) {
 
     let mut c = 2;
 
+    // KZero ChessStdMapper order: per colour (us, then them) kingside then queenside
     for colour in colours {
         let rights = bs.board().castle_rights(colour);
 
-        scalar_data[c] = if rights.long.is_some() { 1.0 } else { 0.0 };
+        scalar_data[c] = if rights.short.is_some() { 1.0 } else { 0.0 };
 
-        scalar_data[c + 1] = if rights.short.is_some() { 1.0 } else { 0.0 };
+        scalar_data[c + 1] = if rights.long.is_some() { 1.0 } else { 0.0 };
 
         c += 2;
     }
@@ -120,7 +180,7 @@ pub fn board_data(bs: &BoardStack) -> (Vec<f32>, Vec<bool>) {
 
     let mut en_passant_plane = vec![false; 64];
 
-    if let Some(pawn_square) = bs.en_passant() {
+    if let Some(pawn_square) = capturable_en_passant(bs) {
         let canonical = canonical_square(pawn_square, us);
 
         let index = canonical.rank() as usize * 8 + canonical.file() as usize;
@@ -137,14 +197,10 @@ pub fn board_data(bs: &BoardStack) -> (Vec<f32>, Vec<bool>) {
 
 // expand scalar and board data into the network input tensor
 
-/// the halfmove clock is stored raw (0..=100) in replay files and scaled to 0..=1 only
-/// when building the network input. The Python trainer applies the same scale in
-/// `lib/data/position.py::write_input`, so old replay files stay valid.
-pub const HALFMOVE_CLOCK_SCALE: f32 = 100.0;
-
+/// Network input, identical to what the replay files store (KZero: the stored input is the
+/// network input). Channel 7 is the raw halfmove clock; TrueNet scales it internally.
 pub fn convert_board(bs: &BoardStack) -> Tensor {
-    let (mut scalar_data, pieces_sqs) = board_data(bs);
-    scalar_data[7] /= HALFMOVE_CLOCK_SCALE;
+    let (scalar_data, pieces_sqs) = board_data(bs);
 
     let mut all_data = Vec::with_capacity(21 * 64);
 
@@ -176,27 +232,10 @@ pub fn extract_policy(bs: &BoardStack, contents: &'static [Move]) -> (Vec<Move>,
         false
     });
 
-    let side = bs.board().side_to_move();
-
-    let mut idx_li = Vec::with_capacity(actual_moves.len());
-
-    for actual_mv in &actual_moves {
-        // canonicalise only the move used for policy lookup
-        let canonical_mv = canonical_move(*actual_mv, side);
-
-        let idx = contents
-            .iter()
-            .position(|x| x == &canonical_mv)
-            .unwrap_or_else(|| {
-                panic!(
-                    "Legal canonical move {} (actual {}) is missing \
-                     from the 1880-entry policy move list",
-                    canonical_mv, actual_mv
-                )
-            });
-
-        idx_li.push(idx);
-    }
+    let idx_li = actual_moves
+        .iter()
+        .map(|&actual_mv| policy_index(bs, actual_mv, contents))
+        .collect();
 
     (actual_moves, idx_li)
 }

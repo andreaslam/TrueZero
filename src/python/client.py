@@ -89,8 +89,7 @@ def model_weights_checksum(model):
 
 
 def load_file(games_path):
-    game = Game.find("chess")
-    return DataFile.open(game, games_path)
+    return DataFile.open(Game.find("chess"), games_path)
 
 
 HOST = os.environ.get("TZ_SERVER_HOST", "127.0.0.1")
@@ -133,9 +132,6 @@ LAST_SENT_NET_CHECKSUM = None
 
 
 def create_optimizer(model):
-    # Reset AdamW state whenever a rejected candidate is discarded.
-    # Otherwise stale momentum could continue pushing the accepted net
-    # toward the rejected candidate.
     return optim.AdamW(
         params=model.parameters(),
         lr=1e-3,
@@ -346,19 +342,14 @@ def main():
             # -------------------------------------------------------
 
             if "RequestingNet" in received_data_string:
-                if pending_candidate_path is None:
-                    send_net_in_bytes(
-                        model,
-                        server,
-                    )
-                else:
-                    # While a candidate is undergoing SPRT, expose the
-                    # accepted network, not the pending candidate.
-                    send_model_from_path(
-                        accepted_model_path,
-                        device,
-                        server,
-                    )
+                # Self-play always uses the last net that passed the gate.
+                # The training weights may have moved on since (a rejected
+                # candidate does not reset them), so never send `model`.
+                send_model_from_path(
+                    accepted_model_path,
+                    device,
+                    server,
+                )
 
             # -------------------------------------------------------
             # SPRT result.
@@ -387,20 +378,17 @@ def main():
                     pending_candidate_gen = None
 
                 else:
+                    # AlphaGo Zero-style gating: the gate decides which net
+                    # generates self-play data, not what the trainer keeps.
+                    # Reverting here would discard every step since the last
+                    # accepted net, so one generation (~16 steps) would have to
+                    # clear the 55% bar on its own for training to progress.
                     print(
-                        "[Training] Candidate rejected; reverting "
-                        "weights and optimiser to accepted net "
-                        f"{accepted_model_path}"
+                        "[Training] Candidate rejected; self-play keeps "
+                        f"{accepted_model_path}, training continues"
                     )
 
                     delete_file_if_exists(pending_candidate_path)
-
-                    model = torch.jit.load(
-                        accepted_model_path,
-                        map_location=device,
-                    ).eval()
-
-                    op = create_optimizer(model)
 
                     pending_candidate_path = None
                     pending_candidate_gen = None
@@ -575,7 +563,8 @@ def extract_incoming_data_given_bytes(
 
     data_dir("python_client_games")
 
-    path = data_path(f"python_client_games/temp_games_{int(time.time())}")
+    # nanoseconds: two files arriving within the same second must not overwrite each other
+    path = data_path(f"python_client_games/temp_games_{time.time_ns()}")
 
     with open(path + ".bin", "wb") as file:
         file.write(bin_data)
@@ -1099,7 +1088,7 @@ def send_model_from_path(
     device,
     server,
 ):
-    print(f"[Training] Sending accepted net while candidate is pending: {model_path}")
+    print(f"[Training] Sending accepted net: {model_path}")
 
     accepted_model = torch.jit.load(
         model_path,
@@ -1131,7 +1120,8 @@ def load_previous_data(
                     data,
                 )
 
-            except Exception:
+            except Exception as e:
+                print(f"[Warning] skipping replay file {file}: {e}")
                 continue
 
     if os.path.exists(LOG_NPZ_PATH):
