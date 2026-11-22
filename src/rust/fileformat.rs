@@ -396,7 +396,7 @@ fn assert_normalized_or_nan(x: f32) {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use cozy_chess::Board;
 
@@ -547,14 +547,15 @@ mod tests {
         output.finish().unwrap();
     }
 
-    struct Record {
-        scalars: Vec<f32>,
-        bools: Vec<u8>,
-        input_scalars: Vec<f32>,
-        policy: Vec<(u32, f32)>,
+    /// One position as stored on disk; `policy` is sorted by policy index.
+    pub(crate) struct Record {
+        pub(crate) scalars: Vec<f32>,
+        pub(crate) bools: Vec<u8>,
+        pub(crate) input_scalars: Vec<f32>,
+        pub(crate) policy: Vec<(u32, f32)>,
     }
 
-    fn read_records(base: &Path) -> (Vec<Record>, Vec<u8>, serde_json::Value) {
+    pub(crate) fn read_records(base: &Path) -> (Vec<Record>, Vec<u8>, serde_json::Value) {
         let bin = std::fs::read(base.with_extension("bin")).unwrap();
         let off = std::fs::read(base.with_extension("off")).unwrap();
         let json: serde_json::Value =

@@ -142,5 +142,90 @@ class PythonEncoderTests(unittest.TestCase):
         self.assertEqual(pi, len(file.positions))
 
 
+@unittest.skipIf(chess is None, "python-chess is not installed")
+class TrainerTargetTests(unittest.TestCase):
+    """The tensors the trainer reads (`PositionBatch`) against python-chess ground truth.
+
+    The fixture is byte-for-byte what TrueZero's Rust writer produces for these games
+    (`fileformat::tests::writes_the_same_records_as_kzero`), so this checks Rust output as
+    the trainer sees it. Invariants T1-T5 in INVARIANTS.md.
+    """
+
+    def test_batch_targets_match_the_games(self):
+        import decoder
+        from lib.data.position import PositionBatch
+
+        game = Game.find("chess")
+        file = DataFile.open(game, KZERO)
+        try:
+            positions = list(file.positions)
+            for p in positions:
+                if not p.is_final:
+                    p.final_position = positions[p.file_pi + int(p.final_moves_left) - 1]
+                else:
+                    p.final_position = p
+            batch = PositionBatch(game, positions, False, False)
+
+            i = 0
+            for line in Path(GAMES).read_text().splitlines():
+                if not line.strip():
+                    continue
+                fen, moves = line.split("|")
+                start = chess.Board() if fen.strip() == "startpos" else chess.Board(fen.strip())
+                moves = moves.split()
+
+                end = start.copy()
+                for mv in moves:
+                    end.push_uci(mv)
+                winner = (not end.turn) if end.is_checkmate() else None
+
+                board = start.copy()
+                for k, mv in enumerate(moves + [None]):
+                    ctx = f"{fen.strip()} ply {k}"
+                    is_final = mv is None
+
+                    # T1: the batch input is the encoder's network input
+                    tensor, _ = decoder.convert_board(board)
+                    self.assertTrue(torch.equal(batch.input_full[i], tensor.float()), ctx)
+
+                    # T2: z is the result from the side to move's point of view
+                    expected_v = 0.0 if winner is None else (1.0 if winner == board.turn else -1.0)
+                    expected_wdl = {1.0: [1, 0, 0], 0.0: [0, 1, 0], -1.0: [0, 0, 1]}[expected_v]
+                    self.assertEqual(batch.v_final[i].item(), expected_v, ctx)
+                    self.assertEqual(batch.wdl_final[i].tolist(), expected_wdl, ctx)
+
+                    # T3: moves left counts down to 0 at the appended final position
+                    expected_ml = 0 if is_final else len(moves) + 1 - k
+                    self.assertEqual(batch.moves_left_final[i].item(), expected_ml, ctx)
+
+                    self.assertEqual(bool(batch.is_final[i]), is_final, ctx)
+                    if is_final and winner is not None:
+                        self.assertTrue(bool(batch.is_terminal[i]), ctx)
+
+                    _, legal = decoder.extract_policy(board)
+                    n = len(legal)
+                    if is_final:
+                        # T4: the final position has no move and no policy target
+                        self.assertEqual(batch.played_mv[i].item(), -1, ctx)
+                        self.assertTrue(bool((batch.policy_values[i] == -1).all()), ctx)
+                    else:
+                        # T4: the played move and the policy target use the encoder's indices
+                        move = chess.Move.from_uci(mv)
+                        played = legal[list(board.legal_moves).index(move)]
+                        self.assertEqual(batch.played_mv[i].item(), played, ctx)
+                        self.assertEqual(
+                            sorted(batch.policy_indices[i, :n].tolist()), sorted(legal), ctx
+                        )
+                        # T5: the policy target is a distribution over exactly the legal moves
+                        values = batch.policy_values[i]
+                        self.assertAlmostEqual(values[:n].sum().item(), 1.0, places=5)
+                        self.assertTrue(bool((values[n:] == -1).all()), ctx)
+                        board.push(move)
+                    i += 1
+            self.assertEqual(i, len(positions))
+        finally:
+            file.close()
+
+
 if __name__ == "__main__":
     unittest.main()

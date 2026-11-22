@@ -34,6 +34,9 @@ pub mod uci;
 pub mod utils;
 
 #[cfg(test)]
+mod invariant_tests;
+
+#[cfg(test)]
 
 mod tests {
     use super::*;
