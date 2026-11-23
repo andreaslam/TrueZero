@@ -23,7 +23,10 @@ use tzrust::{
     mcts_trainer::{EvalMode, TypeRequest::TrainerSearch},
     message_types::{DataFileType, Entity, MessageServer, MessageType, Statistics},
     selfplay::{CollectorMessage, DataGen},
-    settings::{CPUCTSettings, FPUSettings, MovesLeftSettings, PSTSettings, SearchSettings},
+    settings::{
+        CPUCTSettings, FPUSettings, MovesLeftSettings, PSTSettings, PlayoutCapSettings,
+        SearchSettings,
+    },
     utils::directory_exists,
 };
 
@@ -54,6 +57,29 @@ fn env_usize(name: &str, default: usize) -> usize {
         },
         Err(_) => default,
     }
+}
+
+/// Playout cap randomisation settings. Defaults follow KataGo's early run (25% full
+/// searches, fast searches capped at 200 visits). `TZ_PCR_FULL_PROB=1` turns it off, so every
+/// move is a full search; `TZ_PCR_EARLY_STOP=0` disables early stopping of fast searches.
+fn playout_cap_from_env() -> Option<PlayoutCapSettings> {
+    let full_search_prob = match env::var("TZ_PCR_FULL_PROB") {
+        Ok(value) => value
+            .trim()
+            .parse::<f32>()
+            .unwrap_or_else(|_| panic!("TZ_PCR_FULL_PROB must be a number, got {value:?}")),
+        Err(_) => 0.25,
+    };
+    if full_search_prob >= 1.0 {
+        return None;
+    }
+    let fast_visits = env_usize("TZ_PCR_FAST_VISITS", 200) as u32;
+    let early_stop = env::var("TZ_PCR_EARLY_STOP").map_or(true, |v| v.trim() != "0");
+    Some(PlayoutCapSettings::new(
+        full_search_prob,
+        fast_visits,
+        early_stop,
+    ))
 }
 
 fn main() {
@@ -176,9 +202,14 @@ fn main() {
                 .unwrap();
         }
 
+        let playout_cap = playout_cap_from_env();
+        println!("[Datagen] playout cap randomisation: {playout_cap:?}");
         for n in 0..num_generators {
             let sender_clone = game_sender.clone();
-            let selfplay_master = DataGen { iterations: 1 };
+            let selfplay_master = DataGen {
+                iterations: 1,
+                playout_cap,
+            };
             let tensor_exe_send_clone = tensor_exe_send.clone();
             let fut_generator = async move {
                 generator_main(sender_clone, selfplay_master, tensor_exe_send_clone, n).await;

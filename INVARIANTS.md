@@ -38,6 +38,19 @@ from the position itself.
 | B1 | Backup adds absolute values with no sign change: `visits = own + Σ child visits` (own ≥ 1), `total = own·net + Σ child totals` for value and WDL, and moves left gains 1 per ply of depth. | `invariant_tests::b1_backup_conserves_visits_and_values`, `tests::test_backup_adds_no_extra_move_at_evaluated_node` |
 | P1 | Child *i* of a node holds the prior of its own move: softmax over legal moves of `logits[policy_index(move)]`; `p^children_pst` renormalised below the root; `move_idx` lists the indices in child order. | `invariant_tests::p1_child_priors_follow_their_own_policy_index` |
 | C1 | Root FPU and c_puct apply to the root's children; the children's settings apply deeper. | `tests::test_root_settings_apply_to_root_children`, `tests::test_puct_with_nonzero_fpu` |
+| E1 | Early stop (`get_move_with_early_stop`) returns the move a full search plays, never uses more visits, and stops early when one move is clearly best. | `invariant_tests::e1_early_stop_plays_the_full_search_move` |
+| E2 | `Tree::root_move_decided` is exact: once it holds, the most-visited root child is the unique most-visited child at the end of the search. | `invariant_tests::e2_root_move_decided_never_changes_the_final_move` |
+
+## Playout cap randomisation (Rust self-play)
+
+| Id | Invariant | Test |
+|----|-----------|------|
+| PCR1 | A fast search caps visits at `min(fast_visits, max_nodes)` and has no root noise; a full search uses the settings unchanged. | `invariant_tests::pcr1_move_settings_for_full_and_fast_searches` |
+| PCR2 | A record with `is_full_search` used the full node count; every other record used at most the fast cap (exactly the cap while moves are sampled, since early stop applies only to greedy moves). p = 0 gives only fast searches, p = 1 only full. The flag and `zero_visits` reach the file. | `invariant_tests::pcr2_selfplay_records_full_and_fast_searches` |
+
+Fast-search records keep their search visit distribution as the policy target: the inherited
+trainer does not read `is_full_search`, and leaving positions out would break the moves-left
+indexing (R7).
 
 ## Self-play records (Rust writer)
 
