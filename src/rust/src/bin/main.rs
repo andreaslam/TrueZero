@@ -45,6 +45,17 @@ fn net_file_checksum(file_path: &str) -> io::Result<String> {
     Ok(format!("{:x}", checksum.finalize()))
 }
 
+/// Reads a positive integer setting from the environment, falling back to `default`.
+fn env_usize(name: &str, default: usize) -> usize {
+    match env::var(name) {
+        Ok(value) => match value.trim().parse::<usize>() {
+            Ok(n) if n > 0 => n,
+            _ => panic!("{name} must be a positive integer, got {value:?}"),
+        },
+        Err(_) => default,
+    }
+}
+
 fn main() {
     tch::set_num_threads(1);
     tch::set_num_interop_threads(1);
@@ -100,10 +111,18 @@ fn main() {
         .expect("Failed to send data");
     println!("Connected to server!");
 
-    let num_executors = 1;
-    // num_executors = max(min(tch::Cuda::device_count() as usize, num_executors), 1);
+    // Two executors on one GPU let one thread pack and unpack its batch on the CPU while the
+    // other's batch runs on the GPU; with one executor the GPU idles during the CPU phases.
+    // Both settings can be overridden without rebuilding, for A/B throughput tests.
+    let num_executors = env_usize("TZ_NUM_EXECUTORS", 2);
     let batch_size = 2048;
-    let num_generators = num_executors * batch_size * 2;
+    // Independent of `num_executors`, so changing the executor count changes one thing only.
+    // More generators than it takes to fill the batches only lengthens every game.
+    let num_generators = env_usize("TZ_NUM_GENERATORS", 2 * batch_size);
+    println!(
+        "[Datagen] {num_executors} executor(s), {num_generators} generators, \
+         batch size {batch_size}"
+    );
 
     let (game_sender, game_receiver) = flume::bounded::<CollectorMessage>(num_generators);
     thread::scope(|s| {

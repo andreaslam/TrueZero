@@ -9,7 +9,7 @@ use crate::{
     uci::UCIMsg,
 };
 use cozy_chess::{Board, Color, GameStatus, Move};
-use flume::Sender;
+use flume::{Sender, TrySendError};
 use lru::LruCache;
 use rand::prelude::*;
 use rand_distr::WeightedIndex;
@@ -144,12 +144,14 @@ impl DataGen {
                 &format!("thread {}, {:#}, {}nps", _thread_name, final_mv, _nps)
             );
             debug_print!("{}", &format!("{:#}", final_mv));
-            nps_sender
-                .send_async(CollectorMessage::GeneratorStatistics(
-                    settings.max_nodes.unwrap() as usize,
-                ))
-                .await
-                .unwrap();
+            // Best-effort statistics: while the collector is busy writing a file (slow on a
+            // network drive) the shared channel fills, and an awaited send here would park every
+            // generator until it drains. Dropping a statistics sample costs nothing.
+            if let Err(TrySendError::Disconnected(_)) = nps_sender.try_send(
+                CollectorMessage::GeneratorStatistics(settings.max_nodes.unwrap() as usize),
+            ) {
+                panic!("collector disconnected");
+            }
             bs.play(final_mv);
             positions.push(pos);
         }

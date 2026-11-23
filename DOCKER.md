@@ -91,6 +91,8 @@ The following variables are runtime configuration and do not require rebuilding:
 | `TZ_MODEL_PATH` | `/data/nets/tz_0.pt` | TorchScript model |
 | `TZ_DEVICE` | `auto` in the image, `cuda` in Compose | `auto`, `cpu`, `cuda`, or `mps` |
 | `TZ_COMMAND` | `ucimain` | Rust binary to execute |
+| `TZ_NUM_EXECUTORS` | `2` | Self-play (`main`) inference threads sharing the GPU |
+| `TZ_NUM_GENERATORS` | `4096` | Self-play (`main`) games played concurrently |
 
 `TZ_DEVICE=cuda` fails explicitly if CUDA is unavailable. `auto` selects CUDA,
 then Apple MPS, then CPU. `TZ_DATA_ROOT` is honored by both Rust and Python,

@@ -5,7 +5,7 @@ use crate::{
 
 use crossbeam::thread;
 
-use flume::{Receiver, RecvError, RecvTimeoutError, Selector, Sender};
+use flume::{Receiver, RecvError, RecvTimeoutError, Selector, Sender, TrySendError};
 
 use std::{
     cmp::min,
@@ -41,6 +41,76 @@ pub enum Message {
     JobTensorExecutor(Result<ExecutorPacket, RecvError>), // (converted) tensor from mcts search that needs NN evaluation
 
     StopServer, // end the executor process
+}
+
+/// Where an executor thread's time goes, summed over one reporting window. Printed every
+/// `STATS_INTERVAL` so a throughput problem can be located without a profiler: a large
+/// `waiting` share means the generators cannot keep the executor fed, large `cat`/`unpack`
+/// shares mean CPU-side batch handling is starving the GPU.
+struct ExecutorStats {
+    window_start: Instant,
+    batches: usize,
+    positions: usize,
+    min_batch: usize,
+    max_batch: usize,
+    waiting: Duration,
+    cat: Duration,
+    eval: Duration,
+    unpack: Duration,
+}
+
+const STATS_INTERVAL: Duration = Duration::from_secs(30);
+
+impl ExecutorStats {
+    fn new() -> Self {
+        ExecutorStats {
+            window_start: Instant::now(),
+            batches: 0,
+            positions: 0,
+            min_batch: usize::MAX,
+            max_batch: 0,
+            waiting: Duration::ZERO,
+            cat: Duration::ZERO,
+            eval: Duration::ZERO,
+            unpack: Duration::ZERO,
+        }
+    }
+
+    fn record_batch(&mut self, size: usize, cat: Duration, eval: Duration, unpack: Duration) {
+        self.batches += 1;
+        self.positions += size;
+        self.min_batch = self.min_batch.min(size);
+        self.max_batch = self.max_batch.max(size);
+        self.cat += cat;
+        self.eval += eval;
+        self.unpack += unpack;
+    }
+
+    fn report_if_due(&mut self, thread_name: &str) {
+        let elapsed = self.window_start.elapsed();
+        if elapsed < STATS_INTERVAL {
+            return;
+        }
+        if self.batches > 0 {
+            let secs = elapsed.as_secs_f64();
+            let share = |d: Duration| 100.0 * d.as_secs_f64() / secs;
+            println!(
+                "[{thread_name}] {:.0}s: {} batches, mean batch {:.0} (min {}, max {}), {:.0} evals/s; \
+                 time: waiting {:.0}%, cat {:.0}%, forward+copy {:.0}%, unpack {:.0}%",
+                secs,
+                self.batches,
+                self.positions as f64 / self.batches as f64,
+                self.min_batch,
+                self.max_batch,
+                self.positions as f64 / secs,
+                share(self.waiting),
+                share(self.cat),
+                share(self.eval),
+                share(self.unpack),
+            );
+        }
+        *self = ExecutorStats::new();
+    }
 }
 
 pub enum ReturnMessage {
@@ -134,6 +204,7 @@ pub fn executor_main(
     let mut evaluation_time_taken_debugger = TimeStampDebugger::create_debug();
 
     let (handler_send, handler_recv) = flume::bounded::<ExecutorPacket>(1);
+    let mut stats = ExecutorStats::new();
 
     thread::scope(|s| {
         let _ = s
@@ -159,7 +230,9 @@ pub fn executor_main(
                 selector = selector.recv(&handler_recv, Message::JobTensorExecutor);
             }
 
+            let wait_start = Instant::now();
             let message = selector.wait();
+            stats.waiting += wait_start.elapsed();
 
             match message {
                 Message::StopServer => break,
@@ -179,22 +252,31 @@ pub fn executor_main(
 
                     let network = network.as_mut().expect("Network should be available");
                     let batch_size = input_vec.len();
+                    let cat_start = Instant::now();
                     let i_v = input_vec.make_contiguous();
                     let input_tensors = Tensor::cat(i_v, 0);
+                    let cat_time = cat_start.elapsed();
 
                     evaluation_time_taken_debugger.reset();
+                    let eval_start = Instant::now();
                     let (board_eval, policy) =
                         eval_state(input_tensors, network).expect("Evaluation failed");
+                    let eval_time = eval_start.elapsed();
                     evaluation_time_taken_debugger.record("evaluation_time_taken", &thread_name);
                     evaluation_time_taken_debugger.reset();
-                    match evals_per_sec_sender {
-                        Some(ref sender) => {
-                            sender
-                                .send(CollectorMessage::ExecutorStatistics(batch_size))
-                                .unwrap();
+                    if let Some(ref sender) = evals_per_sec_sender {
+                        // Statistics are best-effort. The collector shares this channel with
+                        // finished games and may be busy writing a file to a slow (network) drive;
+                        // a blocking send here would stall the GPU until it catches up.
+                        match sender.try_send(CollectorMessage::ExecutorStatistics(batch_size)) {
+                            Ok(()) | Err(TrySendError::Full(_)) => {}
+                            Err(TrySendError::Disconnected(_)) => {
+                                panic!("collector disconnected")
+                            }
                         }
-                        None => {}
                     }
+
+                    let unpack_start = Instant::now();
 
                     packing_time_debugger.reset();
                     for i in 0..batch_size {
@@ -217,6 +299,8 @@ pub fn executor_main(
                     }
 
                     packing_time_debugger.record("packing_time", &thread_name);
+                    stats.record_batch(batch_size, cat_time, eval_time, unpack_start.elapsed());
+                    stats.report_if_due(&thread_name);
 
                     drop(input_vec.drain(0..batch_size));
                     waiting_for_batch_debugger.reset();
