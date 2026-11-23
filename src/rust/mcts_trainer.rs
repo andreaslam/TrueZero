@@ -859,6 +859,48 @@ pub async fn get_move(
     ZeroEvaluationAbs,
     u32,
 ) {
+    get_move_with_early_stop(bs, tensor_exe_send, settings, id, cache, stop_signal, false).await
+}
+
+impl Tree {
+    /// True when the most-visited root child leads every other child by more visits than the
+    /// search has left before `target_visits`, so no other move can become the most visited
+    /// (the move `get_move` returns). Strict: a possible tie is not decided.
+    pub fn root_move_decided(&self, target_visits: u32) -> bool {
+        let remaining = target_visits.saturating_sub(self.nodes[0].visits);
+        let mut best = 0;
+        let mut second = 0;
+        for child in self.nodes[0].children.clone() {
+            let v = self.nodes[child].visits;
+            if v > best {
+                second = best;
+                best = v;
+            } else if v > second {
+                second = v;
+            }
+        }
+        best > 0 && best - second > remaining
+    }
+}
+
+/// `get_move`, optionally stopping as soon as the most-visited root move is decided
+/// (`Tree::root_move_decided`). With `early_stop` the move returned is the same as a full
+/// search's, but the visit distribution (the policy target) comes from fewer visits.
+pub async fn get_move_with_early_stop(
+    bs: BoardStack,
+    tensor_exe_send: &Sender<Packet>,
+    settings: SearchSettings,
+    id: usize,
+    cache: &mut LruCache<CacheEntryKey, ZeroEvaluationAbs>,
+    stop_signal: Option<Receiver<crate::uci::UCIMsg>>,
+    early_stop: bool,
+) -> (
+    Move,
+    ZeroEvaluationAbs,
+    Option<Vec<usize>>,
+    ZeroEvaluationAbs,
+    u32,
+) {
     let sw_uci = Instant::now();
     let thread_name = format!("generator-{}", id);
     let mut tree = Tree::new(bs, settings);
@@ -870,6 +912,12 @@ pub async fn get_move(
             let min_visits_for_policy = 2;
             let target_visits = (max_nodes as u32).max(min_visits_for_policy);
             while tree.nodes[0].visits < target_visits {
+                if early_stop
+                    && tree.nodes[0].visits >= min_visits_for_policy
+                    && tree.root_move_decided(target_visits)
+                {
+                    break;
+                }
                 if let Some(ref signal) = stop_signal {
                     match signal.try_recv() {
                         Ok(_) if tree.nodes[0].visits >= min_visits_for_policy => break,

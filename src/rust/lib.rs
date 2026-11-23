@@ -682,7 +682,10 @@ mod tests {
         settings.max_nodes = Some(8);
         let mut cache = LruCache::new(NonZeroUsize::new(1000).unwrap());
         let mut output = BinaryOutput::new(&out, "chess").unwrap();
-        let datagen = DataGen { iterations: 1 };
+        let datagen = DataGen {
+            iterations: 1,
+            playout_cap: None,
+        };
         for game in 0..2 {
             let simulation = futures::executor::block_on(datagen.play_game(
                 &tensor_send,
