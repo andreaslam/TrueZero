@@ -10,7 +10,7 @@ use std::{
 
 use crate::{
     boardmanager::BoardStack,
-    dataformat::{Position, Simulation, ZeroValuesPov},
+    dataformat::{Outcome, Position, Simulation, ZeroValuesPov},
     decoder::{board_data, extract_policy, policy_index},
     mcts_trainer::Wdl,
     mvs::get_contents,
@@ -120,6 +120,7 @@ impl BinaryOutput {
         let Simulation {
             positions,
             final_board,
+            outcome,
         } = simulation;
 
         // collect metadata statistics
@@ -138,15 +139,22 @@ impl BinaryOutput {
         ));
 
         let is_terminal = final_board.is_terminal();
-        let hit_move_limit = !is_terminal;
+        // a game decided off the board (resignation, timeout, agreed draw) has a real result
+        // even though its final board is not terminal
+        let hit_move_limit = !is_terminal && outcome.is_none();
         if hit_move_limit {
             self.hit_move_limit_count += 1;
         }
-        let winner: Option<Color> = match final_board.status() {
-            GameStatus::Drawn => None,
-            GameStatus::Won => Some(!final_board.board().side_to_move()),
-            GameStatus::Ongoing => None,
-        }; // colour (if any) that won the game
+        // colour (if any) that won the game
+        let winner: Option<Color> = match outcome {
+            Some(Outcome::Win(color)) => Some(*color),
+            Some(Outcome::Draw) => None,
+            None => match final_board.status() {
+                GameStatus::Drawn => None,
+                GameStatus::Won => Some(!final_board.board().side_to_move()),
+                GameStatus::Ongoing => None,
+            },
+        };
 
         // KZero: `outcome.pov(start_board.next_player())`, i.e. from the point of view of the
         // player to move in the first position, not White.
@@ -436,10 +444,35 @@ pub(crate) mod tests {
         let simulation = Simulation {
             positions: vec![],
             final_board: BoardStack::new(Board::default()),
+            outcome: None,
         };
 
         output.append(&simulation).unwrap();
         assert_eq!(output.hit_move_limit_count, 1);
+
+        for extension in ["bin", "off", "json", "json.tmp"] {
+            let _ = std::fs::remove_file(path.with_extension(extension));
+        }
+    }
+
+    #[test]
+    fn off_board_outcome_is_a_result_not_a_move_limit() {
+        let path = std::env::temp_dir().join(format!(
+            "tzrust-fileformat-outcome-test-{}",
+            std::process::id()
+        ));
+        let mut output = BinaryOutput::new(&path, "chess").unwrap();
+        // White resigns in the starting position: Black wins although the board is not terminal
+        output
+            .append(&Simulation {
+                positions: vec![],
+                final_board: BoardStack::new(Board::default()),
+                outcome: Some(Outcome::Win(Color::Black)),
+            })
+            .unwrap();
+        assert_eq!(output.hit_move_limit_count, 0);
+        // the root player (White) lost
+        assert_eq!(output.total_root_wdl, [0, 0, 1]);
 
         for extension in ["bin", "off", "json", "json.tmp"] {
             let _ = std::fs::remove_file(path.with_extension(extension));
@@ -541,6 +574,7 @@ pub(crate) mod tests {
                 .append(&Simulation {
                     positions,
                     final_board: bs,
+                    outcome: None,
                 })
                 .unwrap();
         }

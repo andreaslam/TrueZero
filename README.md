@@ -55,18 +55,30 @@ execution, one-command updates, rollback, and Slurm/Apptainer usage.
 ## Setting environment variables
 
 
-Set the following environment variables to configure `tch-rs` before running anything. This assumes you are using at least PyTorch version 2.1 to use and set up. Use a [virtual environment if neeeded](https://docs.python.org/3/library/venv.html). 
+## Python environment
+
+Python dependencies are managed with [uv](https://docs.astral.sh/uv/) (`pyproject.toml` + `uv.lock`). From the project root:
+
+```
+uv sync
+```
+
+This creates `.venv/` with Python 3.12 (from `.python-version`) and every default dependency group: `torch`, `gui` (training plots, GUI), `viz` (visualisation, TensorBoard) and `tools`. Run scripts with `uv run`, e.g. `uv run python client.py`, or activate `.venv` first. To install only the libtorch version the Rust `tch` crate is built against (what the Docker image uses), run `uv sync --no-default-groups --group tch`.
+
+## Setting environment variables
+
+Set the following environment variables to configure `tch-rs` before running anything (or `source script.sh`).
 
 ```
 export LIBTORCH_USE_PYTORCH=1
-PYTORCH_PATH=$(python3 -c "import torch; print(torch.__path__[0])")
+PYTORCH_PATH=$(uv run python -c "import torch; print(torch.__path__[0])")
 export LD_LIBRARY_PATH="$PYTORCH_PATH/lib:$LD_LIBRARY_PATH"
 ```
 
 On Windows, it's
 ```
 $env:LIBTORCH_USE_PYTORCH=1
-$PYTORCH_PATH = python -c "import torch; print(torch.__path__[0])"
+$PYTORCH_PATH = uv run python -c "import torch; print(torch.__path__[0])"
 $env:PATH = "$PYTORCH_PATH\lib;$env:PATH"
 ```
 
@@ -84,7 +96,7 @@ Python side (from `src/python`):
 
 ```
 cd src/python
-python client.py
+uv run python client.py
 ```
 
 Rust side (from `src/rust`):
@@ -101,36 +113,43 @@ cargo run --bin server --release
 
 ### Lichess bot
 
-`lichess` uses the same RustDataGen server connection, neural-network byte
-stream, batched `executor_main`, and `BinaryOutput` collector as `main`.
-It only plays and records Lichess games. Start `server` and `client.py` as
-above, export `LICHESS_API_KEY`, then run:
+`lichess` plays on Lichess with the networks supplied by the training server.
+It connects to the server like `main` (a RustDataGen, honouring
+`TZ_SERVER_HOST`/`TZ_SERVER_PORT`) and evaluates positions with the same
+batched executors. Start `server` (and `client.py`, which provides the
+networks) as above, export `LICHESS_API_KEY`, then run:
 
 ```
 cd src/rust
 cargo run --bin lichess --release
 ```
 
-The client waits for the executor to load the first network supplied by the
-training server before it logs into Lichess, indexes the player graph, issues
-challenges, or starts playing games. After that barrier, Lichess game handling
-continues while later networks are loaded by the same executor pool.
+The bot waits until the first network is loaded, then accepts incoming
+standard-chess challenges, offers a rematch after each game, and challenges
+randomly chosen online bots whenever it has no game in progress. Later
+networks are loaded as the server sends them.
 
-Executor and queue settings can be overridden without changing the binary
-(available for the Lichess binary only for now):
+**Training on Lichess games is off by default.** The bot then only plays: it
+searches without exploration noise and sends no games to the server. To use
+its games as training data, set:
 
 ```powershell
-$env:TZ_NUM_EXECUTORS = "2"
-$env:TZ_BATCH_SIZE = "1024"
-$env:TZ_TENSOR_QUEUE_CAPACITY = "4096"
+$env:TZ_LICHESS_COLLECT_DATA = "1"
 ```
 
-By default, the Lichess client uses two executors and a batch size of 1024.
+With collection on, the positions where TrueZero was to move are written with
+the game's Lichess result (including resignations, timeouts and agreed draws)
+and sent to the server every 100 games, like self-play data. Aborted games are
+not recorded.
 
-The bot never uses a hard-coded network path: it writes the network bytes
-received from the server under the project `nets/` directory. Lichess
-training records contain only positions where TrueZero was to move; the
-terminal board and result are retained for each recorded game.
+Other settings:
+
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `TZ_NUM_EXECUTORS` | `2` | Executor threads |
+| `TZ_BATCH_SIZE` | `1024` | Executor batch size |
+| `TZ_TENSOR_QUEUE_CAPACITY` | executors × batch size | Evaluation queue length |
+| `TZ_MAX_CONCURRENT_GAMES` | `4` | Games played at once; extra challenges are declined |
 
 All data (`nets/`, `games/`, `hidden/`, `python_client_games/`, `log.npz`) is read from and written to the project root automatically, regardless of where you launch each process.
 

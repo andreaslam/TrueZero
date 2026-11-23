@@ -176,6 +176,7 @@ impl DataGen {
         let tz = Simulation {
             positions,
             final_board: bs,
+            outcome: None,
         };
 
         debug_print!(

@@ -49,6 +49,16 @@ pub struct Simulation {
     pub positions: Vec<Position>,
     // can be non-terminal if the game was stopped by the length limit
     pub final_board: BoardStack,
+    /// The result when it was decided off the board (resignation, timeout, agreed draw).
+    /// `None` means the result is read from `final_board`.
+    pub outcome: Option<Outcome>,
+}
+
+/// A game result that does not have to follow from the final board.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Outcome {
+    Win(Color),
+    Draw,
 }
 
 impl Simulation {

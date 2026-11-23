@@ -5,26 +5,31 @@ FROM nvidia/cuda:${CUDA_VERSION}-cudnn8-devel-ubuntu22.04 AS builder
 
 ARG RUST_VERSION=1.95.0
 ENV DEBIAN_FRONTEND=noninteractive \
-    PIP_DISABLE_PIP_VERSION_CHECK=1 \
-    PIP_NO_CACHE_DIR=1 \
+    UV_PROJECT_ENVIRONMENT=/opt/venv \
+    UV_PYTHON=/usr/bin/python3 \
+    UV_PYTHON_DOWNLOADS=never \
+    UV_COMPILE_BYTECODE=1 \
+    UV_LINK_MODE=copy \
     LIBTORCH_USE_PYTORCH=1 \
     LIBTORCH_BYPASS_VERSION_CHECK=1 \
     TZ_DATA_ROOT=/opt/truezero
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates curl git build-essential clang libclang-dev pkg-config \
-    libssl-dev python3 python3-dev python3-pip python3-venv \
+    libssl-dev python3 python3-dev \
     && rm -rf /var/lib/apt/lists/*
 
 RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | \
     sh -s -- -y --default-toolchain ${RUST_VERSION} --profile minimal
 ENV PATH="/root/.cargo/bin:${PATH}"
+COPY --from=ghcr.io/astral-sh/uv:0.11.29 /uv /uvx /usr/local/bin/
 
 WORKDIR /opt/truezero
-COPY requirements-tch-only.txt .
-RUN python3 -m venv /opt/venv && \
-    /opt/venv/bin/pip install --upgrade pip setuptools && \
-    /opt/venv/bin/pip install -r requirements-tch-only.txt
+COPY pyproject.toml uv.lock ./
+# The `tch` group pins the torch wheel the Rust tch crate links against (see pyproject.toml).
+# The venv uses the system python3 so it still works in the runtime stage.
+RUN --mount=type=cache,target=/root/.cache/uv \
+    uv sync --locked --no-default-groups --group tch
 ENV PATH="/opt/venv/bin:${PATH}" \
     LIBTORCH="$(python3 -c 'import torch; print(torch.__path__[0])')"
 

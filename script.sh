@@ -2,5 +2,5 @@
 
 export LIBTORCH_USE_PYTORCH=1
 export LIBTORCH_BYPASS_VERSION_CHECK=1 
-PYTORCH_PATH=$(python3 -c "import torch; print(torch.__path__[0])")
+PYTORCH_PATH=$(uv run python -c "import torch; print(torch.__path__[0])")
 export LD_LIBRARY_PATH="$PYTORCH_PATH/lib:$LD_LIBRARY_PATH"

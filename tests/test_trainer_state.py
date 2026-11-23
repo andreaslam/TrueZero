@@ -4,7 +4,7 @@ client.py checkpoints the training weights, the optimiser and the position in
 the LR schedule after every training round and restores them on start-up, but
 only when the checkpoint continues from the accepted net. Run from `src/python`:
 
-    PYTHONPATH=. python -m unittest discover -s ../../tests
+    PYTHONPATH=. uv run python -m unittest discover -s ../../tests
 """
 
 import os

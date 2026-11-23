@@ -124,7 +124,7 @@ file in the job script.
 ## Compatibility and upgrades
 
 The compatibility source of truth is the CUDA base image in `Dockerfile`,
-`requirements-tch-only.txt`, `src/rust/Cargo.toml`, `src/rust/Cargo.lock`, and
+the `tch` dependency group in `pyproject.toml` (locked in `uv.lock`), `src/rust/Cargo.toml`, `src/rust/Cargo.lock`, and
 `rust-toolchain.toml`. Upgrade CUDA and PyTorch together, rebuild from a clean
 cache, run Rust tests and the GPU smoke test, then publish a new version tag.
 Do not install host NVIDIA drivers into the image.

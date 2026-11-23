@@ -12,6 +12,7 @@ services:
       TZ_MODEL_PATH: ${TZ_MODEL_PATH:-/data/nets/tz_0.pt}
       RUST_BACKTRACE: "1"
       LICHESS_API_KEY: ${LICHESS_API_KEY:-}
+      TZ_LICHESS_COLLECT_DATA: ${TZ_LICHESS_COLLECT_DATA:-0}
     ports:
       - "${TRUEZERO_PORT:-38475}:38475"
     volumes:

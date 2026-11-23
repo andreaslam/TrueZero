@@ -7,9 +7,16 @@ import re
 import socket
 import threading
 import time
+import warnings
 
 import network as network
 import torch
+
+# the Rust self-play engine loads TorchScript (.pt) via libtorch, so torch.export is not
+# a drop-in replacement; silence the jit.save/jit.load deprecation notice
+warnings.filterwarnings(
+    "ignore", message=r"`torch\.jit\.(load|save)` is deprecated", category=FutureWarning
+)
 from lib.data.file import DataFile
 from lib.games import Game
 from lib.logger import Logger
@@ -1590,6 +1597,11 @@ def check_net_exists(
             "w+",
         ) as f:
             f.write(data_path("nets/tz_0.pt") + "\n")
+
+        # A brand new run must not inherit metrics from a previous run.
+        if os.path.exists(LOG_NPZ_PATH):
+            os.remove(LOG_NPZ_PATH)
+            print("[Training] New run: reset log.npz")
 
         training_nets.append(data_path("nets/tz_0.pt"))
 

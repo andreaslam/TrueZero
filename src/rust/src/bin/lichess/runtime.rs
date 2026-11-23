@@ -1,621 +1,268 @@
-use super::*;
-use tzrust::lichess_graph::*;
+//! Lichess account, event stream and matchmaking.
 
-pub(super) async fn game_loop(
-    token: String,
-    tensor_exe_send: Sender<Packet>,
-    collector_send: Sender<CollectorMessage>,
-    executor_ready_recv: Receiver<bool>,
-    num_executors: usize,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    println!("Waiting for the training server to provide and load the first network...");
-    for _ in 0..num_executors {
-        executor_ready_recv
-            .recv_async()
-            .await
-            .map_err(|error| format!("Executor did not load the first network: {error}"))?;
+use std::{
+    collections::{HashMap, HashSet},
+    sync::{Arc, Mutex},
+    time::{Duration, Instant},
+};
+
+use flume::Sender;
+use futures_util::StreamExt;
+use litchee::{
+    api::gameplay::{
+        board::LichessIncomingEvent,
+        challenges::{LichessChallenge, LichessChallengeColor, LichessChallengeStatus},
+    },
+    model::{LichessColor, LichessVariantKey},
+    LichessClient,
+};
+use rand::seq::SliceRandom;
+use tokio::time::sleep;
+use tzrust::{executor::Packet, selfplay::CollectorMessage};
+
+use super::{game, BoxError, Config};
+
+const EVENT_STREAM_RECONNECT_DELAY: Duration = Duration::from_secs(2);
+
+/// How often to look for online bots to challenge while no game is being played.
+const MATCHMAKING_INTERVAL: Duration = Duration::from_secs(60);
+/// Do not challenge the same bot again within this time.
+const CHALLENGE_COOLDOWN: Duration = Duration::from_secs(30 * 60);
+const CHALLENGE_SEND_DELAY: Duration = Duration::from_secs(2);
+const CHALLENGE_RATED: bool = true;
+
+/// Clock (initial seconds, increment seconds) for each outgoing challenge, picked at random.
+const TIME_CONTROLS: [(u32, u32); 4] = [(1_800, 0), (600, 5), (180, 2), (60, 0)];
+
+/// State shared by the event loop, matchmaking and every game.
+pub struct Bot {
+    pub client: LichessClient,
+    pub username: String,
+    pub tensor_send: Sender<Packet>,
+    /// `Some` only when finished games are recorded for training.
+    pub collector: Option<Sender<CollectorMessage>>,
+    max_games: usize,
+    /// Ids of the games that currently have a worker.
+    games: Mutex<HashSet<String>>,
+}
+
+impl Bot {
+    pub fn active_games(&self) -> usize {
+        self.games.lock().unwrap().len()
     }
-    println!("Initial network loaded; starting Lichess services.");
-    let (discovery_sender, discovery_receiver) = watch::channel(true);
+}
 
-    let client = Arc::new(
-        LichessClient::builder()
-            .token(&token)
-            .build()
-            .expect("Failed to build Lichess client"),
-    );
+/// Removes a game from `Bot::games` when its worker ends, however it ends.
+struct GameSlot {
+    bot: Arc<Bot>,
+    id: String,
+}
 
-    let me = client
-        .account()
-        .profile()
-        .await
-        .expect("Failed to fetch Lichess profile");
-
-    println!("Logged in as {}", me.user.username);
-
-    if let Some(perfs) = me.user.perfs.as_ref() {
-        if let Some(blitz) = perfs.blitz.as_ref() {
-            println!("Current Blitz rating: {}", blitz.rating);
-        } else {
-            println!(
-                "Current Blitz rating unavailable: \
-                 account has no Blitz rating."
-            );
-        }
-    } else {
-        println!(
-            "Current Blitz rating unavailable: \
-             account has no performance data."
-        );
+impl Drop for GameSlot {
+    fn drop(&mut self) {
+        self.bot.games.lock().unwrap().remove(&self.id);
     }
+}
 
-    let api_request_lock = Arc::new(Mutex::new(()));
-    let graph_db = Arc::new(Mutex::new(open_player_graph_database(
-        PLAYER_GRAPH_DB_PATH,
-    )?));
+pub async fn run(
+    config: &Config,
+    tensor_send: Sender<Packet>,
+    collector: Option<Sender<CollectorMessage>>,
+) -> Result<(), BoxError> {
+    let client = LichessClient::builder().token(&config.token).build()?;
+    let profile = client.account().profile().await?;
+    println!("[Lichess] Logged in as {}.", profile.user.username);
 
-    let active_games = Arc::new(AtomicUsize::new(0));
-    let max_concurrent_games =
-        env_usize("TZ_MAX_CONCURRENT_GAMES", DEFAULT_MAX_CONCURRENT_GAMES).max(1);
-    let game_slots = Arc::new(Semaphore::new(max_concurrent_games));
-    println!("Lichess concurrent game limit: {}", max_concurrent_games);
-
-    let event_client = Arc::clone(&client);
-
-    let event_tensor_send = tensor_exe_send.clone();
-
-    let event_api_lock = Arc::clone(&api_request_lock);
-    let event_graph_db = Arc::clone(&graph_db);
-    let event_discovery_sender = discovery_sender.clone();
-
-    let event_active_games = Arc::clone(&active_games);
-
-    let event_task = tokio::spawn(async move {
-        event_loop(
-            event_client,
-            event_tensor_send,
-            collector_send.clone(),
-            event_api_lock,
-            event_active_games,
-            game_slots,
-            event_graph_db,
-            event_discovery_sender,
-        )
-        .await
+    let bot = Arc::new(Bot {
+        client,
+        username: profile.user.username,
+        tensor_send,
+        collector,
+        max_games: config.max_concurrent_games,
+        games: Mutex::new(HashSet::new()),
     });
 
-    /*
-     * Matchmaking has its own task and therefore can never block
-     * consumption of the Lichess event stream.
-     */
-    let matchmaking_client = Arc::clone(&client);
-
-    let matchmaking_api_lock = Arc::clone(&api_request_lock);
-    let matchmaking_active_games = Arc::clone(&active_games);
-    let matchmaking_graph_db = Arc::clone(&graph_db);
-    let matchmaking_discovery_receiver = discovery_receiver;
-    let matchmaking_discovery_sender = discovery_sender;
-
-    let username = me.user.username.clone();
-
-    let matchmaking_task = tokio::spawn(async move {
-        matchmaking_loop(
-            matchmaking_client,
-            username,
-            matchmaking_api_lock,
-            matchmaking_active_games,
-            matchmaking_graph_db,
-            matchmaking_discovery_receiver,
-            matchmaking_discovery_sender,
-        )
-        .await
-    });
-
+    let matchmaking = tokio::spawn(matchmaking_loop(Arc::clone(&bot)));
     tokio::select! {
-        result = event_task => {
-            return match result {
-                Ok(Ok(())) => {
-                    Err(
-                        "Lichess event task terminated unexpectedly"
-                            .into()
-                    )
-                }
-
-                Ok(Err(error)) => {
-                    Err(error)
-                }
-
-                Err(error) => {
-                    Err(
-                        format!(
-                            "Lichess event task panicked: {}",
-                            error
-                        )
-                        .into()
-                    )
-                }
-            };
-        }
-
-        result = matchmaking_task => {
-            return match result {
-                Ok(Ok(())) => {
-                    Err(
-                        "Matchmaking task terminated unexpectedly"
-                            .into()
-                    )
-                }
-
-                Ok(Err(error)) => {
-                    Err(error)
-                }
-
-                Err(error) => {
-                    Err(
-                        format!(
-                            "Matchmaking task panicked: {}",
-                            error
-                        )
-                        .into()
-                    )
-                }
-            };
-        }
+        result = event_loop(Arc::clone(&bot)) => result,
+        result = matchmaking => Err(format!("matchmaking stopped: {result:?}").into()),
     }
 }
 
-pub(super) async fn event_loop(
-    client: Arc<LichessClient>,
-    tensor_exe_send: Sender<Packet>,
-    collector_send: Sender<CollectorMessage>,
-    api_request_lock: Arc<Mutex<()>>,
-    active_games: Arc<AtomicUsize>,
-    game_slots: Arc<Semaphore>,
-    graph_db: Arc<Mutex<Connection>>,
-    discovery_sender: watch::Sender<bool>,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+async fn event_loop(bot: Arc<Bot>) -> Result<(), BoxError> {
     loop {
-        println!("Opening Lichess bot event stream...");
-
-        let bot_api = client.bot();
-
-        let mut events = match bot_api.stream_events().await {
-            Ok(stream) => {
-                println!("Lichess bot event stream connected.");
-
-                stream
-            }
-
-            Err(error) => {
-                eprintln!(
-                    "Failed to open Lichess bot \
-                         event stream: {}",
-                    error
-                );
-
-                sleep(Duration::from_millis(EVENT_STREAM_RECONNECT_DELAY_MS)).await;
-
-                continue;
-            }
-        };
-
-        while let Some(event_result) = events.next().await {
-            match event_result {
-                Ok(LichessIncomingEvent::Challenge { challenge }) => {
-                    println!("Incoming challenge event: {:?}", challenge);
-
-                    if !matches!(challenge.status, LichessChallengeStatus::Created) {
-                        println!(
-                            "Ignoring challenge {} with status {:?}",
-                            challenge.id, challenge.status
-                        );
-
-                        continue;
-                    }
-
-                    println!(
-                        "Accepting challenge {}: {} -> {} (direction={:?})",
-                        challenge.id,
-                        challenge
-                            .challenger
-                            .as_ref()
-                            .map(|user| user.name.as_str())
-                            .unwrap_or("<unknown>"),
-                        challenge
-                            .dest_user
-                            .as_ref()
-                            .map(|user| user.name.as_str())
-                            .unwrap_or("<unknown>"),
-                        challenge.direction
-                    );
-
-                    let _api_guard = api_request_lock.lock().await;
-
-                    println!("Accepting incoming challenge {}.", challenge.id);
-
-                    match client.challenges().accept(&challenge.id, None).await {
-                        Ok(_) => {
-                            println!("Accepted challenge {}", challenge.id);
+        match bot.client.bot().stream_events().await {
+            Ok(mut events) => {
+                println!("[Lichess] Event stream connected.");
+                while let Some(event) = events.next().await {
+                    match event {
+                        Ok(LichessIncomingEvent::Challenge { challenge }) => {
+                            handle_challenge(&bot, &challenge).await
                         }
-
-                        Err(error) => {
-                            eprintln!("Failed to accept challenge {}: {}", challenge.id, error);
-                        }
-                    }
-                }
-
-                Ok(LichessIncomingEvent::GameStart { game }) => {
-                    let Some(game_id) = game.id else {
-                        println!("GameStart without game ID");
-
-                        continue;
-                    };
-
-                    let Some(our_color) = game.color else {
-                        println!(
-                            "GameStart {} without \
-                             our color",
-                            game_id
-                        );
-
-                        continue;
-                    };
-
-                    println!("Game started: {} ({:?})", game_id, our_color);
-
-                    let game_permit = match Arc::clone(&game_slots).try_acquire_owned() {
-                        Ok(permit) => permit,
-                        Err(_) => {
-                            eprintln!(
-                                "Game {} exceeds TZ_MAX_CONCURRENT_GAMES; \
-                                 not starting another game worker.",
-                                game_id
-                            );
-                            continue;
-                        }
-                    };
-
-                    let game_client = Arc::clone(&client);
-
-                    let game_tensor_send = tensor_exe_send.clone();
-
-                    let game_active_games = Arc::clone(&active_games);
-
-                    let game_api_lock = Arc::clone(&api_request_lock);
-                    let game_collector_send = collector_send.clone();
-                    let game_graph_db = Arc::clone(&graph_db);
-                    let game_discovery_sender = discovery_sender.clone();
-                    tokio::spawn(async move {
-                        match run_game_owned(
-                            game_client,
-                            game_id.clone(),
-                            our_color,
-                            game_tensor_send,
-                            game_collector_send,
-                            Arc::clone(&game_active_games),
-                            game_api_lock,
-                            game_permit,
-                        )
-                        .await
-                        {
-                            Ok(Some(opponent)) => {
-                                let db = game_graph_db.lock().await;
-                                match graph_remove_player(&db, &opponent) {
-                                    Ok(true) => println!(
-                                        "Removed successfully played player {} from graph.",
-                                        opponent
-                                    ),
-                                    Ok(false) => println!(
-                                        "Successfully played {}, but it was not in the graph.",
-                                        opponent
-                                    ),
-                                    Err(error) => eprintln!(
-                                        "Failed to remove successfully played player {}: {}",
-                                        opponent, error
-                                    ),
-                                }
-                                let _ = game_discovery_sender.send(true);
+                        Ok(LichessIncomingEvent::GameStart { game }) => {
+                            match (game.game_id.or(game.id), game.color) {
+                                (Some(id), Some(color)) => start_game(&bot, id, color).await,
+                                _ => eprintln!("[Lichess] gameStart without id or colour."),
                             }
-                            Ok(None) => {}
-                            Err(error) => eprintln!("Game {} error: {}", game_id, error),
                         }
-
-                        println!("Game {} finished.", game_id);
-                    });
+                        Ok(_) => {}
+                        Err(error) => {
+                            eprintln!("[Lichess] Event stream error: {error}");
+                            break;
+                        }
+                    }
                 }
-
-                Ok(_other) => {
-                    println!("Ignoring unrelated bot event.");
-                }
-
-                Err(error) => {
-                    eprintln!("Lichess bot event stream error: {}", error);
-
-                    break;
-                }
+                eprintln!("[Lichess] Event stream ended; reconnecting.");
             }
+            Err(error) => eprintln!("[Lichess] Could not open the event stream: {error}"),
         }
+        sleep(EVENT_STREAM_RECONNECT_DELAY).await;
+    }
+}
 
-        println!(
-            "Global Lichess event stream ended; \
-             reconnecting in {} ms...",
-            EVENT_STREAM_RECONNECT_DELAY_MS
+async fn handle_challenge(bot: &Bot, challenge: &LichessChallenge) {
+    // the event stream also reports our own outgoing challenges
+    let incoming = challenge.direction.as_deref() != Some("out")
+        && challenge
+            .challenger
+            .as_ref()
+            .is_some_and(|user| !user.name.eq_ignore_ascii_case(&bot.username));
+    if !incoming || !matches!(challenge.status, LichessChallengeStatus::Created) {
+        return;
+    }
+    let challenger = challenge
+        .challenger
+        .as_ref()
+        .map_or("<unknown>", |user| user.name.as_str());
+
+    let variant = challenge.variant.as_ref().and_then(|variant| variant.key);
+    let decline_reason = if !matches!(
+        variant,
+        None | Some(LichessVariantKey::Standard) | Some(LichessVariantKey::FromPosition)
+    ) {
+        Some("standard")
+    } else if bot.active_games() >= bot.max_games {
+        Some("later")
+    } else {
+        None
+    };
+
+    let challenges = bot.client.challenges();
+    let result = match decline_reason {
+        Some(reason) => {
+            println!(
+                "[Lichess] Declining challenge {} from {challenger} ({reason}).",
+                challenge.id
+            );
+            challenges.decline(&challenge.id, Some(reason)).await
+        }
+        None => {
+            println!(
+                "[Lichess] Accepting challenge {} from {challenger}.",
+                challenge.id
+            );
+            challenges.accept(&challenge.id, None).await
+        }
+    };
+    if let Err(error) = result {
+        eprintln!(
+            "[Lichess] Could not answer challenge {}: {error}",
+            challenge.id
         );
-
-        sleep(Duration::from_millis(EVENT_STREAM_RECONNECT_DELAY_MS)).await;
     }
 }
 
-pub(super) async fn matchmaking_loop(
-    client: Arc<LichessClient>,
-    our_username: String,
-    api_request_lock: Arc<Mutex<()>>,
-    active_games: Arc<AtomicUsize>,
-    graph_db: Arc<Mutex<Connection>>,
-    discovery_receiver: watch::Receiver<bool>,
-    discovery_sender: watch::Sender<bool>,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let mut bot_challenge_cooldowns: HashMap<String, Instant> = HashMap::new();
-
-    let mut bot_pending_challenges: HashSet<String> = HashSet::new();
-
-    let mut human_pending_challenges: HashSet<String> = HashSet::new();
-
-    let mut scan_interval =
-        tokio::time::interval(Duration::from_secs(ONLINE_BOT_SCAN_INTERVAL_SECS));
-
-    loop {
-        scan_interval.tick().await;
-
-        wait_for_no_active_games(&active_games, "player discovery").await;
-
-        if !*discovery_receiver.borrow() {
-            continue;
+async fn start_game(bot: &Arc<Bot>, id: String, color: LichessColor) {
+    {
+        let mut games = bot.games.lock().unwrap();
+        // Lichess repeats gameStart for ongoing games when the event stream reconnects
+        if games.contains(&id) {
+            return;
         }
-
-        /*
-         * EXISTING BOT MATCHMAKING.
-         */
-        if let Err(error) = challenge_online_bots(
-            &client,
-            &our_username,
-            &mut bot_challenge_cooldowns,
-            &mut bot_pending_challenges,
-            &api_request_lock,
-        )
-        .await
-        {
-            eprintln!("Online bot matchmaking error: {}", error);
+        if games.len() >= bot.max_games {
+            drop(games);
+            eprintln!("[Lichess] Too many concurrent games; aborting game {id}.");
+            if let Err(error) = bot.client.bot().abort(&id).await {
+                eprintln!("[Lichess] Could not abort game {id}: {error}");
+            }
+            return;
         }
-
-        let graph_has_capacity = {
-            let db = graph_db.lock().await;
-            graph_player_count(&db).map(|count| count < MAX_GRAPH_PLAYERS)
-        };
-
-        let graph_has_capacity = match graph_has_capacity {
-            Ok(true) => {
-                if let Err(error) = expand_player_graph(&client, &our_username, &graph_db).await {
-                    eprintln!("Player graph expansion error: {}", error);
-                }
-                true
-            }
-            Ok(false) => {
-                println!("Player graph is full; skipping discovery and leaving graph unchanged.");
-                false
-            }
-            Err(error) => {
-                eprintln!("Could not inspect player graph capacity: {}", error);
-                false
-            }
-        };
-
-        /*
-         * EXISTING DIRECT ONLINE-HUMAN SOURCE.
-         *
-         * This remains unchanged conceptually and is still useful because
-         * it discovers currently-online users independently of the graph.
-         */
-        if graph_has_capacity {
-            if let Err(error) = challenge_online_humans(
-                &client,
-                &our_username,
-                &mut human_pending_challenges,
-                &api_request_lock,
-                &graph_db,
-            )
-            .await
-            {
-                eprintln!("Online human matchmaking error: {}", error);
-            }
-        }
-
-        let _ = discovery_sender.send(false);
+        games.insert(id.clone());
     }
-}
-
-async fn wait_for_no_active_games(active_games: &AtomicUsize, workload: &str) {
-    let mut paused = false;
-    while active_games.load(Ordering::Acquire) > 0 {
-        if !paused {
-            println!("Pausing {workload} while Lichess games are active.");
-            paused = true;
+    let slot = GameSlot {
+        bot: Arc::clone(bot),
+        id,
+    };
+    tokio::spawn(async move {
+        println!("[Lichess] Game {} started as {color:?}.", slot.id);
+        if let Err(error) = game::run_game(&slot.bot, &slot.id, color).await {
+            eprintln!("[Lichess] Game {} error: {error}", slot.id);
         }
-        sleep(Duration::from_millis(250)).await;
-    }
-    if paused {
-        println!("Resuming {workload}; no Lichess games are active.");
-    }
-}
-
-/*
- * EXISTING BOT MATCHMAKING.
- */
-pub(super) async fn challenge_online_bots(
-    client: &LichessClient,
-    our_username: &str,
-    cooldowns: &mut HashMap<String, Instant>,
-    pending_challenges: &mut HashSet<String>,
-    api_request_lock: &Arc<Mutex<()>>,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    println!("Scanning currently-online Lichess bots...");
-
-    let bot_api = client.bot();
-
-    let mut online_bots = bot_api.online(None).await?;
-
-    let now = Instant::now();
-
-    cooldowns.retain(|_, last_attempt| {
-        now.duration_since(*last_attempt).as_secs() < ONLINE_BOT_CHALLENGE_COOLDOWN_SECS
+        println!("[Lichess] Game {} ended.", slot.id);
     });
+}
 
-    pending_challenges.retain(|username| cooldowns.contains_key(username));
-
-    let mut online_count = 0usize;
-
-    let mut challenge_count = 0usize;
-
-    while let Some(bot_result) = online_bots.next().await {
-        let bot = match bot_result {
-            Ok(bot) => bot,
-
-            Err(error) => {
-                eprintln!(
-                    "Error while reading online \
-                         bot list: {}",
-                    error
-                );
-
-                continue;
-            }
-        };
-
-        online_count += 1;
-
-        if bot.username.eq_ignore_ascii_case(our_username) {
-            println!("Skipping ourselves: {}", bot.username);
-
+/// Challenges online bots while no game is being played.
+async fn matchmaking_loop(bot: Arc<Bot>) {
+    let mut last_challenged: HashMap<String, Instant> = HashMap::new();
+    let mut interval = tokio::time::interval(MATCHMAKING_INTERVAL);
+    loop {
+        interval.tick().await;
+        if bot.active_games() > 0 {
             continue;
         }
-
-        if challenge_count >= MAX_BOT_CHALLENGES_PER_SCAN {
-            println!(
-                "Reached bot matchmaking limit of {} \
-                 challenge attempts this scan.",
-                MAX_BOT_CHALLENGES_PER_SCAN
-            );
-
-            break;
-        }
-
-        if pending_challenges.contains(&bot.username) {
-            println!(
-                "Skipping {}: outgoing challenge \
-                 already pending.",
-                bot.username
-            );
-
-            continue;
-        }
-
-        if let Some(last_attempt) = cooldowns.get(&bot.username) {
-            let age = now.duration_since(*last_attempt).as_secs();
-
-            if age < ONLINE_BOT_CHALLENGE_COOLDOWN_SECS {
-                println!(
-                    "Skipping {}: challenge cooldown \
-                     active ({}s old).",
-                    bot.username, age
-                );
-
-                continue;
-            }
-        }
-
-        cooldowns.insert(bot.username.clone(), now);
-
-        pending_challenges.insert(bot.username.clone());
-
-        challenge_count += 1;
-
-        let challenge_color = challenge_color_for_bot(&bot.username);
-
-        let time_control = random_time_control();
-        let (initial_seconds, increment_seconds) = time_control.clock();
-
-        println!(
-            "Challenging online bot {} as {:?} with \
-             {:?} ({}+{} rated) ({}/{})",
-            bot.username,
-            challenge_color,
-            time_control,
-            initial_seconds / 60,
-            increment_seconds,
-            challenge_count,
-            MAX_BOT_CHALLENGES_PER_SCAN
-        );
-
-        let result = {
-            let _api_guard = api_request_lock.lock().await;
-
-            client
-                .challenges()
-                .challenge(&bot.username)
-                .color(challenge_color)
-                .rated(BOT_CHALLENGE_RATED)
-                .clock(initial_seconds, increment_seconds)
-                .send()
-                .await
-        };
-
-        match result {
-            Ok(challenge) => {
-                println!(
-                    "Challenge sent to {}: \
-                     id={}, status={:?}",
-                    bot.username, challenge.id, challenge.status
-                );
-
-                if !matches!(challenge.status, LichessChallengeStatus::Created) {
-                    pending_challenges.remove(&bot.username);
-                }
-            }
-
-            Err(error) => {
-                eprintln!("Failed to challenge {}: {}", bot.username, error);
-
-                pending_challenges.remove(&bot.username);
-            }
-        }
-
-        if challenge_count < MAX_BOT_CHALLENGES_PER_SCAN {
-            sleep(Duration::from_millis(BOT_CHALLENGE_SEND_DELAY_MS)).await;
+        last_challenged.retain(|_, at| at.elapsed() < CHALLENGE_COOLDOWN);
+        if let Err(error) = challenge_online_bots(&bot, &mut last_challenged).await {
+            eprintln!("[Lichess] Matchmaking error: {error}");
         }
     }
+}
 
-    println!(
-        "Online bot scan complete: {} bots seen, \
-         {} challenge attempts made, \
-         {} outgoing challenges currently pending.",
-        online_count,
-        challenge_count,
-        pending_challenges.len()
-    );
+async fn challenge_online_bots(
+    bot: &Bot,
+    last_challenged: &mut HashMap<String, Instant>,
+) -> Result<(), BoxError> {
+    let mut candidates = Vec::new();
+    let mut online = bot.client.bot().online(None).await?;
+    while let Some(user) = online.next().await {
+        match user {
+            Ok(user)
+                if !user.username.eq_ignore_ascii_case(&bot.username)
+                    && !last_challenged.contains_key(&user.username) =>
+            {
+                candidates.push(user.username)
+            }
+            Ok(_) => {}
+            Err(error) => eprintln!("[Lichess] Error reading the online bot list: {error}"),
+        }
+    }
+    candidates.shuffle(&mut rand::thread_rng());
+    candidates.truncate(bot.max_games);
 
+    for (index, username) in candidates.into_iter().enumerate() {
+        if index > 0 {
+            sleep(CHALLENGE_SEND_DELAY).await;
+        }
+        let (initial, increment) = *TIME_CONTROLS
+            .choose(&mut rand::thread_rng())
+            .expect("time controls are not empty");
+        println!(
+            "[Lichess] Challenging {username} ({}+{increment}).",
+            initial / 60
+        );
+        last_challenged.insert(username.clone(), Instant::now());
+        let result = bot
+            .client
+            .challenges()
+            .challenge(&username)
+            .color(LichessChallengeColor::Random)
+            .rated(CHALLENGE_RATED)
+            .clock(initial, increment)
+            .send()
+            .await;
+        if let Err(error) = result {
+            eprintln!("[Lichess] Could not challenge {username}: {error}");
+        }
+    }
     Ok(())
 }
-
-/*
- * ============================================================================
- * PLAYER GRAPH
- * ============================================================================
- *
- * This is the additional human-discovery source.
- *
- * It deliberately does NOT replace the existing /player implementation.
- */
-
-/*
- * Open/create the persistent graph database.
- */

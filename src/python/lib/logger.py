@@ -30,6 +30,11 @@ class Logger:
         assert self.curr_batch >= 0, "No batch has been started yet"
         key = (group, name)
 
+        # loss tensors arrive still attached to the autograd graph; detach them
+        # so the conversion to a float does not warn (or keep the graph alive)
+        if hasattr(value, "detach"):
+            value = value.detach().item()
+
         if key in self.data:
             a = self.data[key]
         else:

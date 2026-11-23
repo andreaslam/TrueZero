@@ -4,7 +4,7 @@
 (kZero commit 5bf3343, generator in `write_fixture.rs.txt`) from `fixture_games.txt`.
 Run from `src/python`:
 
-    PYTHONPATH=. python -m unittest discover -s ../../tests
+    PYTHONPATH=. uv run python -m unittest discover -s ../../tests
 """
 
 import os

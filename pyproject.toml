@@ -4,8 +4,58 @@ build-backend = "maturin"
 
 [project]
 name = "tzrust"
-requires-python = ">=3.8"
-dynamic = ["version"]
+requires-python = ">=3.10"
+version = "0.1.0"  # keep in sync with src/rust/Cargo.toml
+# Shared by every environment. torch is not listed here: it comes from exactly one of
+# the `torch` or `tch` groups below.
+dependencies = [
+    "numpy==1.26.4",
+    "chess>=1.11",
+]
+
+[dependency-groups]
+# Local development (default): current torch for training and the Python tools.
+torch = [
+    "torch==2.14.0",
+    "torchvision==0.29.0",
+    "setuptools==84.1.0",
+]
+# The libtorch version the Rust `tch` crate (0.17) is built against. Used by the Docker
+# image, which links the Rust binaries to this wheel via LIBTORCH_USE_PYTORCH=1.
+tch = [
+    "torch==2.4.1",
+    "setuptools==84.1.0",
+]
+# Live training plots (lib/plotter.py), the GUI and the remote scheduler.
+gui = [
+    "PyQt5==5.15.11",
+    "PyQt5-sip==12.17.1",
+    "pyqtgraph==0.12.4",
+    "darkdetect==0.5.1",
+    "scipy==1.11.4",
+    "PySide6>=6.7",
+    "paramiko>=3.4",
+]
+# Network/input visualisation and TensorBoard export.
+viz = [
+    "matplotlib>=3.8",
+    "pillow>=10",
+    "tensorboard>=2.16",
+]
+# Misc scripts: experiment.py, trainonly.py, onnx_exporter.py.
+tools = [
+    "requests>=2.31",
+    "tqdm>=4.66",
+    "onnx>=1.16",
+]
+
+[tool.uv]
+# The Python side is a set of scripts, not an installable package; don't build the
+# Rust extension (maturin) on `uv sync`.
+package = false
+default-groups = ["torch", "gui", "viz", "tools"]
+conflicts = [[{ group = "torch" }, { group = "tch" }]]
 
 [tool.maturin]
+manifest-path = "src/rust/Cargo.toml"
 features = ["pyo3/extension-module"]
