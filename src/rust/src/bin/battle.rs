@@ -69,7 +69,7 @@ fn main() {
 
     panic::set_hook(Box::new(|panic_info| {
         // print panic information
-        eprintln!("Panic occurred: {:?}", panic_info);
+        eprintln!("Panic occurred: {}", panic_info);
         // exit the program immediately
         std::process::exit(1);
     }));

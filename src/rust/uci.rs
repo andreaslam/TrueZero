@@ -125,7 +125,7 @@ pub fn go_visit_limit(
 
 pub fn run_uci(net_path: &str) {
     panic::set_hook(Box::new(|panic_info| {
-        eprintln!("Panic occurred: {:?}", panic_info);
+        eprintln!("Panic occurred: {}", panic_info);
         std::process::exit(1);
     }));
 
