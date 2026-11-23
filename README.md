@@ -140,10 +140,10 @@ To use TrueZero through UCI, run the following from `src/rust`:
 
 ```
 cd src/rust
-cargo run --bin ucimain --release
+cargo run --bin ucimain --release -- nets/tz_42.pt
 ```
 
-The engine loads its network from `nets/` at the project root. The compiled binaries (in `src/rust/target/release/`) can also be launched directly from any directory.
+The optional argument is the network file, resolved relative to the project root (or `TZ_DATA_ROOT` if set); an absolute path also works. Without it, the engine uses `TZ_MODEL_PATH` if set, otherwise `nets/tz_0.pt`. The compiled binaries (in `src/rust/target/release/`) can also be launched directly from any directory.
 
 ## Internal Engine testing (non-UCI compliant)
 - `getdecode.rs` - used for obtaining the encoded NN inputs.
