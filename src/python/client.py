@@ -134,6 +134,8 @@ data_dir("hidden")
 DATAFILE_PATH = data_path("hidden/datafile.txt")
 TRAINING_LOG_PATH = data_path("hidden/traininglog.txt")
 LOG_NPZ_PATH = data_path("log.npz")
+TRAINER_STATE_PATH = data_path("hidden/trainer_state.pt")
+TRAINER_STATE_VERSION = 1
 
 LAST_SENT_NET_CHECKSUM = None
 
@@ -144,6 +146,102 @@ def create_optimizer(model):
         lr=1e-3,
         weight_decay=1e-4,
     )
+
+
+def save_trainer_state(model, op, accepted_gen, candidate_gen, path=None):
+    """Checkpoint the training weights and optimiser after a training round.
+
+    The accepted net on disk is not enough to resume training: a rejected
+    candidate does not reset the training weights, and AdamW's moment
+    estimates and step counts exist only in the optimiser. Restarting from the
+    accepted net with a fresh optimiser rolls training back to the last
+    accepted net, and the first steps afterwards move every parameter by about
+    lr whatever its gradient scale (bias-corrected moments from one gradient).
+
+    The checkpoint is serialised in memory, written to a temporary file and
+    renamed over the old one, so a crash or a dropped share mid-write leaves the
+    previous checkpoint intact. An I/O error only skips this checkpoint.
+    """
+    path = path or TRAINER_STATE_PATH
+    tmp_path = path + ".tmp"
+
+    buffer = io.BytesIO()
+    torch.save(
+        {
+            "version": TRAINER_STATE_VERSION,
+            "accepted_gen": accepted_gen,
+            "candidate_gen": candidate_gen,
+            "model": model.state_dict(),
+            "optimizer": op.state_dict(),
+        },
+        buffer,
+    )
+
+    try:
+        with open(tmp_path, "wb") as f:
+            f.write(buffer.getvalue())
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp_path, path)
+    except OSError as e:
+        print(f"[Warning] failed to save trainer state: {e!r}")
+        try:
+            os.remove(tmp_path)
+        except OSError:
+            pass
+        return False
+
+    return True
+
+
+def load_trainer_state(model, accepted_gen, device, path=None):
+    """Restore the training weights and optimiser saved by save_trainer_state.
+
+    Returns the optimiser to train with. The checkpoint is used only if it
+    continues from the accepted net: it was written while `accepted_gen` was
+    accepted, or by the round whose candidate became `accepted_gen` (whose
+    weights are exactly that net). Otherwise, or if the file is unreadable or
+    does not fit the model, `model` keeps the accepted net's weights and a fresh
+    optimiser is returned.
+    """
+    path = path or TRAINER_STATE_PATH
+
+    if not os.path.exists(path):
+        print("[Training] No trainer state found; starting a fresh optimiser.")
+        return create_optimizer(model)
+
+    try:
+        state = torch.load(path, map_location=device, weights_only=True)
+
+        if state.get("version") != TRAINER_STATE_VERSION:
+            raise ValueError(f"unsupported version {state.get('version')!r}")
+
+        if not state["accepted_gen"] <= accepted_gen <= state["candidate_gen"]:
+            raise ValueError(
+                f"saved for generations {state['accepted_gen']}..."
+                f"{state['candidate_gen']}, but the accepted net is {accepted_gen}"
+            )
+
+        current = model.state_dict()
+        saved = state["model"]
+        if set(saved) != set(current) or any(
+            saved[k].shape != current[k].shape for k in current
+        ):
+            raise ValueError("saved weights do not match the network architecture")
+
+        op = create_optimizer(model)
+        op.load_state_dict(state["optimizer"])
+        model.load_state_dict(saved)
+
+    except Exception as e:
+        print(f"[Warning] ignoring trainer state {path}: {e!r}")
+        return create_optimizer(model)
+
+    print(
+        "[Training] Resumed training weights and optimiser from "
+        f"{path} (saved after training candidate {state['candidate_gen']})."
+    )
+    return op
 
 
 def receiver_loop(server, message_queue, receiver_stop_event):
@@ -265,7 +363,9 @@ def main():
         mask_policy=True,
     )
 
-    op = create_optimizer(model)
+    # Resume the training weights (which may be ahead of the accepted net) and
+    # the optimiser. Self-play still gets `accepted_model_path`.
+    op = load_trainer_state(model, accepted_gen, device)
 
     log = load_previous_data(
         data_paths,
@@ -757,6 +857,13 @@ def full_train_and_send(
             recent_train_sampler=recent_train_sampler,
             num_steps_training=num_steps_training,
         )
+
+    save_trainer_state(
+        model,
+        op,
+        accepted_gen=starting_gen - 1,
+        candidate_gen=starting_gen,
+    )
 
     test_net(
         model,
