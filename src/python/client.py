@@ -134,16 +134,250 @@ data_dir("hidden")
 DATAFILE_PATH = data_path("hidden/datafile.txt")
 TRAINING_LOG_PATH = data_path("hidden/traininglog.txt")
 LOG_NPZ_PATH = data_path("log.npz")
+TRAINER_STATE_PATH = data_path("hidden/trainer_state.pt")
+TRAINER_STATE_VERSION = 1
 
 LAST_SENT_NET_CHECKSUM = None
 
 
 def create_optimizer(model):
+    # The learning rate is set before every step by LrSchedule.apply.
     return optim.AdamW(
         params=model.parameters(),
         lr=1e-3,
         weight_decay=1e-4,
     )
+
+
+# ---------------------------------------------------------------------------
+# Learning-rate schedule
+#
+# Modelled on what AlphaZero-style engines do for continual self-play training:
+#
+# - A warm-up at the start: KataGo trains its first 2M samples at 1/20 rising to
+#   1x of the full rate; Lc0 ramps linearly over `warmup_steps`.
+# - Then piecewise-constant drops keyed on how much has been trained, never on
+#   a planned end point: AlphaZero 0.2 -> 0.02 -> 0.002 -> 0.0002 over 700k
+#   steps; Lc0 `lr_values`/`lr_boundaries`; KataGo's `-lr-schedule` keyed on
+#   samples trained. A cosine-to-zero schedule needs a known run length, which
+#   continual training does not have, so it is not used here.
+#
+# The position in the schedule is the number of samples trained (steps times
+# batch size, like KataGo's global_step_samples), so the schedule is unchanged
+# if BATCH_SIZE changes. It is saved in the trainer checkpoint with the
+# optimiser. A fresh optimiser starts the schedule at zero, so it warms up
+# again rather than taking full-rate steps from empty Adam moments.
+#
+# Override with environment variables:
+#   TZ_LR_SCHEDULE        "samples:lr,..." piecewise-constant points, starting
+#                         at 0; counts take K/M/B suffixes, e.g. "0:1e-3,50M:5e-4"
+#   TZ_LR_WARMUP_SAMPLES  warm-up length in samples (0 disables warm-up)
+# ---------------------------------------------------------------------------
+
+DEFAULT_LR_SCHEDULE = "0:1e-3,50M:5e-4,100M:2.5e-4,200M:1e-4"
+DEFAULT_LR_WARMUP_SAMPLES = "1M"
+
+# The warm-up starts at this fraction of the scheduled rate (KataGo: 1/20).
+LR_WARMUP_START_FRACTION = 0.05
+
+
+def parse_sample_count(text):
+    text = text.strip().upper()
+    scale = {"K": 10**3, "M": 10**6, "B": 10**9}.get(text[-1:], 1)
+    if scale != 1:
+        text = text[:-1]
+    value = float(text) * scale
+    if value < 0 or value != int(value):
+        raise ValueError(f"invalid sample count {text!r}")
+    return int(value)
+
+
+def parse_lr_schedule(text):
+    """Parse "samples:lr,samples:lr,..." into sorted (samples, lr) points."""
+    points = []
+    for item in text.split(","):
+        if not item.strip():
+            continue
+        samples, lr = item.split(":")
+        lr = float(lr)
+        if not lr > 0:
+            raise ValueError(f"learning rate must be positive, got {lr}")
+        points.append((parse_sample_count(samples), lr))
+
+    points.sort()
+    if not points or points[0][0] != 0:
+        raise ValueError("the LR schedule must start at sample 0")
+    if len({s for s, _ in points}) != len(points):
+        raise ValueError("the LR schedule repeats a sample count")
+    return points
+
+
+class LrSchedule:
+    """Warm-up then piecewise-constant learning rate, keyed on samples trained."""
+
+    def __init__(self, points, warmup_samples, samples_trained=0):
+        self.points = points
+        self.warmup_samples = warmup_samples
+        self.samples_trained = samples_trained
+
+    @classmethod
+    def from_env(cls):
+        return cls(
+            parse_lr_schedule(os.environ.get("TZ_LR_SCHEDULE", DEFAULT_LR_SCHEDULE)),
+            parse_sample_count(
+                os.environ.get("TZ_LR_WARMUP_SAMPLES", DEFAULT_LR_WARMUP_SAMPLES)
+            ),
+        )
+
+    def lr(self):
+        lr = self.points[0][1]
+        for start, value in self.points:
+            if self.samples_trained >= start:
+                lr = value
+
+        if self.samples_trained < self.warmup_samples:
+            progress = self.samples_trained / self.warmup_samples
+            lr *= LR_WARMUP_START_FRACTION + (1 - LR_WARMUP_START_FRACTION) * progress
+
+        return lr
+
+    def apply(self, op):
+        """Set the learning rate for the next optimiser step and return it."""
+        lr = self.lr()
+        for group in op.param_groups:
+            group["lr"] = lr
+        return lr
+
+    def advance(self, batch_size):
+        self.samples_trained += batch_size
+
+    def state_dict(self):
+        return {"samples_trained": self.samples_trained}
+
+    def load_state_dict(self, state):
+        samples_trained = int(state["samples_trained"])
+        if samples_trained < 0:
+            raise ValueError(f"invalid samples_trained {samples_trained}")
+        self.samples_trained = samples_trained
+
+
+def scheduled_train_step(train_settings, batch, model, op, schedule, log):
+    """One optimiser step at the scheduled learning rate."""
+    lr = schedule.apply(op)
+    train_settings.train_step(
+        batch,
+        network=model,
+        optimizer=op,
+        logger=log,
+    )
+    schedule.advance(BATCH_SIZE)
+    log.log("schedule", "lr", lr)
+    # Separate group so the plotter does not draw lr against a count in the millions.
+    log.log("samples", "trained", schedule.samples_trained)
+
+
+def save_trainer_state(model, op, schedule, accepted_gen, candidate_gen, path=None):
+    """Checkpoint the training weights, optimiser and LR schedule after a round.
+
+    The accepted net on disk is not enough to resume training: a rejected
+    candidate does not reset the training weights, and AdamW's moment
+    estimates and step counts exist only in the optimiser. Restarting from the
+    accepted net with a fresh optimiser rolls training back to the last
+    accepted net, and the first steps afterwards move every parameter by about
+    lr whatever its gradient scale (bias-corrected moments from one gradient).
+
+    The checkpoint is serialised in memory, written to a temporary file and
+    renamed over the old one, so a crash or a dropped share mid-write leaves the
+    previous checkpoint intact. An I/O error only skips this checkpoint.
+    """
+    path = path or TRAINER_STATE_PATH
+    tmp_path = path + ".tmp"
+
+    buffer = io.BytesIO()
+    torch.save(
+        {
+            "version": TRAINER_STATE_VERSION,
+            "accepted_gen": accepted_gen,
+            "candidate_gen": candidate_gen,
+            "model": model.state_dict(),
+            "optimizer": op.state_dict(),
+            "schedule": schedule.state_dict(),
+        },
+        buffer,
+    )
+
+    try:
+        with open(tmp_path, "wb") as f:
+            f.write(buffer.getvalue())
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp_path, path)
+    except OSError as e:
+        print(f"[Warning] failed to save trainer state: {e!r}")
+        try:
+            os.remove(tmp_path)
+        except OSError:
+            pass
+        return False
+
+    return True
+
+
+def load_trainer_state(model, accepted_gen, device, path=None):
+    """Restore the training weights, optimiser and schedule saved by save_trainer_state.
+
+    Returns the optimiser and LR schedule to train with. The checkpoint is used only if it
+    continues from the accepted net: it was written while `accepted_gen` was
+    accepted, or by the round whose candidate became `accepted_gen` (whose
+    weights are exactly that net). Otherwise, or if the file is unreadable or
+    does not fit the model, `model` keeps the accepted net's weights, and a fresh
+    optimiser and a schedule at sample 0 (so in warm-up) are returned.
+    """
+    path = path or TRAINER_STATE_PATH
+
+    # Parsed outside the try below: a bad TZ_LR_SCHEDULE must stop the trainer,
+    # not be reported as an unreadable checkpoint.
+    LrSchedule.from_env()
+
+    if not os.path.exists(path):
+        print("[Training] No trainer state found; starting a fresh optimiser.")
+        return create_optimizer(model), LrSchedule.from_env()
+
+    try:
+        state = torch.load(path, map_location=device, weights_only=True)
+
+        if state.get("version") != TRAINER_STATE_VERSION:
+            raise ValueError(f"unsupported version {state.get('version')!r}")
+
+        if not state["accepted_gen"] <= accepted_gen <= state["candidate_gen"]:
+            raise ValueError(
+                f"saved for generations {state['accepted_gen']}..."
+                f"{state['candidate_gen']}, but the accepted net is {accepted_gen}"
+            )
+
+        current = model.state_dict()
+        saved = state["model"]
+        if set(saved) != set(current) or any(
+            saved[k].shape != current[k].shape for k in current
+        ):
+            raise ValueError("saved weights do not match the network architecture")
+
+        schedule = LrSchedule.from_env()
+        schedule.load_state_dict(state["schedule"])
+        op = create_optimizer(model)
+        op.load_state_dict(state["optimizer"])
+        model.load_state_dict(saved)
+
+    except Exception as e:
+        print(f"[Warning] ignoring trainer state {path}: {e!r}")
+        return create_optimizer(model), LrSchedule.from_env()
+
+    print(
+        "[Training] Resumed training weights, optimiser and LR schedule from "
+        f"{path} (saved after training candidate {state['candidate_gen']}; "
+        f"{schedule.samples_trained:,} samples trained, lr {schedule.lr():.3g})."
+    )
+    return op, schedule
 
 
 def receiver_loop(server, message_queue, receiver_stop_event):
@@ -265,7 +499,14 @@ def main():
         mask_policy=True,
     )
 
-    op = create_optimizer(model)
+    # Resume the training weights (which may be ahead of the accepted net) and
+    # the optimiser. Self-play still gets `accepted_model_path`.
+    op, schedule = load_trainer_state(model, accepted_gen, device)
+    print(
+        f"[Training] LR schedule {schedule.points}, warm-up "
+        f"{schedule.warmup_samples:,} samples; now at "
+        f"{schedule.samples_trained:,} samples, lr {schedule.lr():.3g}"
+    )
 
     log = load_previous_data(
         data_paths,
@@ -485,6 +726,7 @@ def main():
                 loopbuf=loopbuf,
                 train_settings=train_settings,
                 op=op,
+                schedule=schedule,
                 log=log,
                 data=None,
                 startup=True,
@@ -522,6 +764,7 @@ def main():
                 loopbuf=loopbuf,
                 train_settings=train_settings,
                 op=op,
+                schedule=schedule,
                 log=log,
                 data=data if "data" in locals() else None,
                 startup=False,
@@ -689,6 +932,7 @@ def full_train_and_send(
     loopbuf,
     train_settings,
     op,
+    schedule,
     log,
     data=None,
     startup=False,
@@ -713,6 +957,7 @@ def full_train_and_send(
             model=model,
             train_settings=train_settings,
             op=op,
+            schedule=schedule,
             log=log,
             train_sampler=train_sampler,
             num_steps_training=num_steps_training,
@@ -752,11 +997,20 @@ def full_train_and_send(
             model=model,
             train_settings=train_settings,
             op=op,
+            schedule=schedule,
             log=log,
             train_sampler=train_sampler,
             recent_train_sampler=recent_train_sampler,
             num_steps_training=num_steps_training,
         )
+
+    save_trainer_state(
+        model,
+        op,
+        schedule,
+        accepted_gen=starting_gen - 1,
+        candidate_gen=starting_gen,
+    )
 
     test_net(
         model,
@@ -794,6 +1048,7 @@ def train_startup(
     model,
     train_settings,
     op,
+    schedule,
     log,
     train_sampler,
     num_steps_training,
@@ -812,12 +1067,7 @@ def train_startup(
 
         batch = train_sampler.next_batch()
 
-        train_settings.train_step(
-            batch,
-            network=model,
-            optimizer=op,
-            logger=log,
-        )
+        scheduled_train_step(train_settings, batch, model, op, schedule, log)
 
     train_sampler.close()
 
@@ -940,6 +1190,7 @@ def train_net(
     model,
     train_settings,
     op,
+    schedule,
     log,
     train_sampler,
     recent_train_sampler,
@@ -960,12 +1211,7 @@ def train_net(
 
         batch = sampler.next_batch()
 
-        train_settings.train_step(
-            batch,
-            network=model,
-            optimizer=op,
-            logger=log,
-        )
+        scheduled_train_step(train_settings, batch, model, op, schedule, log)
 
     train_sampler.close()
     recent_train_sampler.close()
