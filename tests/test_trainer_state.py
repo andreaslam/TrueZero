@@ -245,7 +245,7 @@ class LrScheduleTests(unittest.TestCase):
         self.assertEqual(settings.lrs_seen, [2e-3])
         self.assertEqual(log.data[("schedule", "lr")][0], 2e-3)
         self.assertEqual(
-            log.data[("schedule", "samples_trained")][0], client.BATCH_SIZE
+            log.data[("samples", "trained")][0], client.BATCH_SIZE
         )
 
     def test_parsing(self):

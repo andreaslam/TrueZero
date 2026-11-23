@@ -272,7 +272,8 @@ def scheduled_train_step(train_settings, batch, model, op, schedule, log):
     )
     schedule.advance(BATCH_SIZE)
     log.log("schedule", "lr", lr)
-    log.log("schedule", "samples_trained", schedule.samples_trained)
+    # Separate group so the plotter does not draw lr against a count in the millions.
+    log.log("samples", "trained", schedule.samples_trained)
 
 
 def save_trainer_state(model, op, schedule, accepted_gen, candidate_gen, path=None):
