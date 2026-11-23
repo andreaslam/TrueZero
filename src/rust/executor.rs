@@ -57,6 +57,10 @@ struct ExecutorStats {
     cat: Duration,
     eval: Duration,
     unpack: Duration,
+    /// Part of `unpack` spent slicing each position's outputs out of the batch tensors.
+    slice: Duration,
+    /// Part of `unpack` spent sending results back (waking each generator's search task).
+    send: Duration,
 }
 
 const STATS_INTERVAL: Duration = Duration::from_secs(30);
@@ -73,10 +77,20 @@ impl ExecutorStats {
             cat: Duration::ZERO,
             eval: Duration::ZERO,
             unpack: Duration::ZERO,
+            slice: Duration::ZERO,
+            send: Duration::ZERO,
         }
     }
 
-    fn record_batch(&mut self, size: usize, cat: Duration, eval: Duration, unpack: Duration) {
+    fn record_batch(
+        &mut self,
+        size: usize,
+        cat: Duration,
+        eval: Duration,
+        unpack: Duration,
+        slice: Duration,
+        send: Duration,
+    ) {
         self.batches += 1;
         self.positions += size;
         self.min_batch = self.min_batch.min(size);
@@ -84,6 +98,8 @@ impl ExecutorStats {
         self.cat += cat;
         self.eval += eval;
         self.unpack += unpack;
+        self.slice += slice;
+        self.send += send;
     }
 
     fn report_if_due(&mut self, thread_name: &str) {
@@ -96,7 +112,8 @@ impl ExecutorStats {
             let share = |d: Duration| 100.0 * d.as_secs_f64() / secs;
             println!(
                 "[{thread_name}] {:.0}s: {} batches, mean batch {:.0} (min {}, max {}), {:.0} evals/s; \
-                 time: waiting {:.0}%, cat {:.0}%, forward+copy {:.0}%, unpack {:.0}%",
+                 time: waiting {:.0}%, cat {:.0}%, forward+copy {:.0}%, unpack {:.0}% \
+                 (slice {:.0}%, send {:.0}%)",
                 secs,
                 self.batches,
                 self.positions as f64 / self.batches as f64,
@@ -107,6 +124,8 @@ impl ExecutorStats {
                 share(self.cat),
                 share(self.eval),
                 share(self.unpack),
+                share(self.slice),
+                share(self.send),
             );
         }
         *self = ExecutorStats::new();
@@ -279,6 +298,8 @@ pub fn executor_main(
                     let unpack_start = Instant::now();
 
                     packing_time_debugger.reset();
+                    let mut slice_time = Duration::ZERO;
+                    let mut send_time = Duration::ZERO;
                     for i in 0..batch_size {
                         let sender: Sender<ReturnMessage> = output_senders
                             .pop_front()
@@ -286,12 +307,14 @@ pub fn executor_main(
                         let id = id_vec
                             .pop_front()
                             .expect("There should be an ID for each job");
+                        let slice_start = Instant::now();
                         let result = (board_eval.get(i as i64), policy.get(i as i64));
                         let return_pack = ReturnPacket { packet: result, id };
-                        if sender
-                            .send(ReturnMessage::ReturnMessage(Ok(return_pack)))
-                            .is_err()
-                        {
+                        let send_start = Instant::now();
+                        slice_time += send_start - slice_start;
+                        let sent = sender.send(ReturnMessage::ReturnMessage(Ok(return_pack)));
+                        send_time += send_start.elapsed();
+                        if sent.is_err() {
                             debug_print!(
                                 "Executor: search request was cancelled before the result arrived"
                             );
@@ -299,7 +322,14 @@ pub fn executor_main(
                     }
 
                     packing_time_debugger.record("packing_time", &thread_name);
-                    stats.record_batch(batch_size, cat_time, eval_time, unpack_start.elapsed());
+                    stats.record_batch(
+                        batch_size,
+                        cat_time,
+                        eval_time,
+                        unpack_start.elapsed(),
+                        slice_time,
+                        send_time,
+                    );
                     stats.report_if_due(&thread_name);
 
                     drop(input_vec.drain(0..batch_size));
