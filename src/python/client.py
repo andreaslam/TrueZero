@@ -27,15 +27,22 @@ class Server:
         self.file = None
 
     def connect(self):
-        while True:
-            try:
-                self.socket.connect((self.host, self.port))
-                print("Connected to server!")
-                self.file = self.socket.makefile("r")
-                break
-            except ConnectionRefusedError as e:
-                print(f"Connection failed: {e}. Retrying...")
-                time.sleep(1)
+        while not self.try_connect():
+            time.sleep(1)
+
+    def try_connect(self) -> bool:
+        # a socket whose connect failed cannot be reused, so start from a fresh one
+        self.close()
+        self.socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.file = None
+        try:
+            self.socket.connect((self.host, self.port))
+        except OSError as e:
+            print(f"Connection failed: {e}. Retrying...")
+            return False
+        print("Connected to server!")
+        self.file = self.socket.makefile("r")
+        return True
 
     def send(self, message):
         message = {"purpose": message}
@@ -315,6 +322,7 @@ def main():
     receiver_thread.start()
 
     stop_requested = False
+    next_reconnect_time = 0.0
 
     while True:
         # ===========================================================
@@ -398,11 +406,15 @@ def main():
             # -------------------------------------------------------
 
             if "JobSendPath" in received_data_string:
-                data = extract_incoming_data_given_path(
-                    loopbuf,
-                    log,
-                    raw_data,
-                )
+                try:
+                    data = extract_incoming_data_given_path(
+                        loopbuf,
+                        log,
+                        raw_data,
+                    )
+                except OSError as e:
+                    print(f"[Warning] skipping incoming replay file: {e!r}")
+                    continue
 
                 if loopbuf.position_count >= MIN_BUFFER_TO_TRAIN:
                     training_due = True
@@ -419,11 +431,15 @@ def main():
             # -------------------------------------------------------
 
             if "JobSendData" in received_data_string:
-                data = extract_incoming_data_given_bytes(
-                    loopbuf,
-                    log,
-                    raw_data,
-                )
+                try:
+                    data = extract_incoming_data_given_bytes(
+                        loopbuf,
+                        log,
+                        raw_data,
+                    )
+                except OSError as e:
+                    print(f"[Warning] skipping incoming replay file: {e!r}")
+                    continue
 
                 if loopbuf.position_count >= MIN_BUFFER_TO_TRAIN:
                     training_due = True
@@ -462,7 +478,7 @@ def main():
                 f"for generation {candidate_gen}."
             )
 
-            candidate_path = full_train_and_send(
+            candidate_path = train_round_or_skip(
                 model=model,
                 starting_gen=candidate_gen,
                 server=server,
@@ -499,7 +515,7 @@ def main():
 
             print(f"[Training] Starting training for generation {candidate_gen}.")
 
-            candidate_path = full_train_and_send(
+            candidate_path = train_round_or_skip(
                 model=model,
                 starting_gen=candidate_gen,
                 server=server,
@@ -530,20 +546,36 @@ def main():
             print("[Server] Connection closed.")
             break
 
-        # A disconnected generator should NOT stop training.
-        if receiver_stop_event.is_set():
-            if not getattr(
-                main,
-                "_receiver_disconnect_reported",
-                False,
-            ):
-                print(
-                    "[Training] Generator/server connection is currently unavailable."
+        # A dropped connection must not stop training: reconnect, re-verify and
+        # restart the receiver. Messages sent while disconnected are lost; a
+        # pending candidate stays pending until the server reports on it.
+        if receiver_stop_event.is_set() and time.time() >= next_reconnect_time:
+            print("[Server] Connection lost; reconnecting.")
+            server.close()
+            try:
+                connected = server.try_connect()
+                if connected:
+                    get_verification(server, "PythonTraining")
+            except (OSError, ConnectionError, json.JSONDecodeError) as e:
+                print(f"[Server] Reconnect failed: {e!r}")
+                connected = False
+
+            if connected:
+                receiver_stop_event = threading.Event()
+                receiver_thread = threading.Thread(
+                    target=receiver_loop,
+                    args=(
+                        server,
+                        message_queue,
+                        receiver_stop_event,
+                    ),
+                    daemon=True,
+                    name="server-receiver",
                 )
-
-                print("[Training] Continuing from the persisted replay buffer.")
-
-                main._receiver_disconnect_reported = True
+                receiver_thread.start()
+                print("[Server] Reconnected.")
+            else:
+                next_reconnect_time = time.time() + RECONNECT_INTERVAL_S
 
 
 def extract_incoming_data_given_bytes(
@@ -607,6 +639,47 @@ def extract_incoming_data_given_bytes(
         print("[Warning] failed to save log.npz")
 
     return data
+
+
+RECONNECT_INTERVAL_S = 5.0
+
+
+def reopen_buffer_files(loopbuf):
+    """Replace every replay-buffer file with freshly opened handles.
+
+    The buffer keeps files open for the whole run. On a network drive the old
+    handles can go stale after the share reconnects, and reads then fail
+    (Windows reports e.g. "network name deleted" as EINVAL). A file that cannot be
+    reopened is dropped from the buffer, with the reason printed.
+    """
+    kept = []
+    for old in loopbuf.files:
+        base = os.path.splitext(str(old.info.bin_path))[0]
+        try:
+            old.close()
+        except OSError:
+            pass
+        try:
+            kept.append(load_file(base))
+        except (OSError, AssertionError) as e:
+            print(f"[Warning] dropping replay file {base} from the buffer: {e!r}")
+            loopbuf.position_count -= len(old.positions)
+            loopbuf.simulation_count -= old.info.simulation_count
+    loopbuf.files = kept
+
+
+def train_round_or_skip(**kwargs):
+    """Run one training round on fresh file handles; skip the round on an I/O error."""
+    loopbuf = kwargs["loopbuf"]
+    reopen_buffer_files(loopbuf)
+    if loopbuf.position_count < MIN_BUFFER_TO_TRAIN:
+        print("[Training] Buffer below minimum after dropping unreadable files.")
+        return None
+    try:
+        return full_train_and_send(**kwargs)
+    except OSError as e:
+        print(f"[Warning] training round skipped after an I/O error: {e!r}")
+        return None
 
 
 def full_train_and_send(
