@@ -87,7 +87,7 @@ fn print_tree(tree: &Tree) {
 
 fn main() {
     panic::set_hook(Box::new(|panic_info| {
-        eprintln!("Panic occurred: {:?}", panic_info);
+        eprintln!("Panic occurred: {}", panic_info);
         std::process::exit(2);
     }));
 

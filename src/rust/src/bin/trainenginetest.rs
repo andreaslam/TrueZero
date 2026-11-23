@@ -120,7 +120,7 @@ fn main() {
     env::set_var("RUST_BACKTRACE", "2");
 
     panic::set_hook(Box::new(|panic_info| {
-        eprintln!("Panic occurred: {:?}", panic_info);
+        eprintln!("Panic occurred: {}", panic_info);
         std::process::exit(1);
     }));
 

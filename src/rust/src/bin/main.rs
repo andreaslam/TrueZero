@@ -76,7 +76,7 @@ fn main() {
     env::set_var("RUST_BACKTRACE", "2");
 
     panic::set_hook(Box::new(|panic_info| {
-        eprintln!("Panic occurred: {:?}", panic_info);
+        eprintln!("Panic occurred: {}", panic_info);
         std::process::exit(1);
     }));
 
@@ -242,6 +242,31 @@ async fn generator_main(
     }
 }
 
+fn new_game_file(id: usize) -> (String, BinaryOutput) {
+    let file_save_time_num = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("Time went backwards")
+        .as_nanos();
+    let path = data_path_str(&format!("games/gen_{}_games_{}", id, file_save_time_num));
+    let bin_output = BinaryOutput::new(path.clone(), "chess")
+        .unwrap_or_else(|e| panic!("could not create game file {path}: {e}"));
+    (path, bin_output)
+}
+
+/// An I/O error while writing a batch of games (seen intermittently on Windows, e.g. a
+/// sharing violation from antivirus or a network drive) loses that batch, not the generator.
+fn discard_game_file(path: &str, action: &str, e: &io::Error, games: usize) {
+    eprintln!(
+        "[collector][Warning] I/O error {action} {path}: {e} (kind {:?}, os error {:?}); \
+         discarding this batch of {games} games and starting a new file",
+        e.kind(),
+        e.raw_os_error()
+    );
+    for ext in [".bin", ".off", ".json", ".json.tmp"] {
+        let _ = fs::remove_file(format!("{path}{ext}"));
+    }
+}
+
 fn serialise_file_to_bytes(file_path: &str) -> io::Result<Vec<u8>> {
     let mut file = File::open(file_path)?;
     let metadata = file.metadata()?;
@@ -270,13 +295,7 @@ fn collector_main(
         println!("created {}", folder_name.display());
     }
     let id = id_recv.recv().unwrap();
-    let file_save_time = SystemTime::now();
-    let file_save_time_duration = file_save_time
-        .duration_since(UNIX_EPOCH)
-        .expect("Time went backwards");
-    let file_save_time_num = file_save_time_duration.as_nanos();
-    let mut path = data_path_str(&format!("games/gen_{}_games_{}", id, file_save_time_num));
-    let mut bin_output = BinaryOutput::new(path.clone(), "chess").unwrap();
+    let (mut path, mut bin_output) = new_game_file(id);
     let mut nps_start_time = Instant::now();
     let mut nps_vec: Vec<usize> = Vec::new();
     let mut evals_start_time = Instant::now();
@@ -286,9 +305,21 @@ fn collector_main(
         let msg = receiver.recv().unwrap();
         match msg {
             CollectorMessage::FinishedGame(sim) => {
-                bin_output.append(&sim).unwrap();
+                if let Err(e) = bin_output.append(&sim) {
+                    let (old_path, games) = (path.clone(), bin_output.game_count());
+                    // replacing the output closes the old file handles before deleting the files
+                    (path, bin_output) = new_game_file(id);
+                    discard_game_file(&old_path, "appending a game to", &e, games);
+                    continue;
+                }
                 if bin_output.game_count() >= 100 && bin_output.position_count() >= 25000 {
-                    bin_output.finish().unwrap();
+                    if let Err(e) = bin_output.finish() {
+                        let (old_path, games) = (path.clone(), bin_output.game_count());
+                        // replacing the output closes the old file handles before deleting the files
+                        (path, bin_output) = new_game_file(id);
+                        discard_game_file(&old_path, "finishing", &e, games);
+                        continue;
+                    }
                     let mut file_data: Vec<Vec<u8>> = Vec::new(); // Clear file_data vector
                     for file in files {
                         let file_path = format!("{}{}", path, file);
@@ -318,13 +349,7 @@ fn collector_main(
                         fs::remove_file(&file_path).expect("failed to delete sent game data file");
                     }
 
-                    let file_save_time = SystemTime::now();
-                    let file_save_time_duration = file_save_time
-                        .duration_since(UNIX_EPOCH)
-                        .expect("Time went backwards");
-                    let file_save_time_num = file_save_time_duration.as_nanos();
-                    path = data_path_str(&format!("games/gen_{}_games_{}", id, file_save_time_num));
-                    bin_output = BinaryOutput::new(path.clone(), "chess").unwrap();
+                    (path, bin_output) = new_game_file(id);
                 }
             }
             CollectorMessage::GeneratorStatistics(nps) => {
