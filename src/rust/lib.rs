@@ -322,7 +322,6 @@ mod tests {
     use executor::{Packet, ReturnMessage, ReturnPacket};
     use lru::LruCache;
     use std::num::NonZeroUsize;
-    use tch::{Device, Kind, Tensor};
 
     const STUB_SEARCH_NODES: u32 = 200;
 
@@ -342,8 +341,8 @@ mod tests {
         let policy_len = mvs::get_contents().len() as i64;
         std::thread::spawn(move || {
             for packet in recv.iter() {
-                let board_eval = Tensor::zeros([5], (Kind::Float, Device::Cpu));
-                let policy = Tensor::zeros([policy_len], (Kind::Float, Device::Cpu));
+                let board_eval = vec![0.0_f32; 5];
+                let policy = vec![0.0_f32; policy_len as usize];
                 let _ = packet
                     .resender
                     .send(ReturnMessage::ReturnMessage(Ok(ReturnPacket {
