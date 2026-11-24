@@ -1,4 +1,5 @@
 use std::{
+    collections::HashMap,
     io::{BufRead, BufReader, Write},
     net::{TcpListener, TcpStream},
     sync::{Arc, Mutex},
@@ -69,11 +70,19 @@ fn clear_pending_candidate(
     had_pending
 }
 
+/// Latest (nodes/s, evals/s, time reported) from each client, keyed by peer address. Clients send
+/// rates, so the server shows the sum of each client's latest rate rather than adding up every
+/// message that happens to land in its print window.
+type ClientRates = HashMap<String, (usize, usize, Instant)>;
+
+/// A client whose last report is older than this no longer counts towards the totals.
+const STATS_STALE_AFTER: Duration = Duration::from_secs(10);
+
 fn handle_client(
     stream: TcpStream,
     clients: Arc<Mutex<Vec<TcpStream>>>,
     messages: Arc<Mutex<Vec<MessageServer>>>,
-    stats_counters: Arc<Mutex<(usize, usize)>>,
+    stats_counters: Arc<Mutex<ClientRates>>,
     start_time: Arc<Mutex<Instant>>,
     net_path: Arc<Mutex<Option<String>>>,
     net_data: Arc<Mutex<Option<Vec<u8>>>>,
@@ -431,27 +440,32 @@ fn handle_client(
                 MessageType::StatisticsSend(statistics) => {
                     debug_print!("StatisticsSend message received: {:?}", statistics);
 
-                    let mut stats = stats_counters.lock().unwrap_or_else(|e| e.into_inner());
+                    let mut rates = stats_counters.lock().unwrap_or_else(|e| e.into_inner());
 
                     let mut start_time = start_time.lock().unwrap_or_else(|e| e.into_inner());
 
-                    let elapsed = start_time.elapsed().as_secs_f32() as usize;
-
+                    let entry = rates
+                        .entry(peer_addr.clone())
+                        .or_insert((0, 0, Instant::now()));
                     match statistics {
                         tzrust::message_types::Statistics::NodesPerSecond(nps) => {
-                            stats.0 += nps;
+                            entry.0 = nps;
                         }
 
                         tzrust::message_types::Statistics::EvalsPerSecond(evals_per_sec) => {
-                            stats.1 += evals_per_sec;
+                            entry.1 = evals_per_sec;
                         }
                     }
+                    entry.2 = Instant::now();
 
-                    if elapsed >= 1 {
-                        println!("[Statistics-nps] {}", stats.0);
-                        println!("[Statistics-evals] {}", stats.1);
+                    if start_time.elapsed() >= Duration::from_secs(1) {
+                        rates.retain(|_, r| r.2.elapsed() < STATS_STALE_AFTER);
+                        let (nps, evals) = rates
+                            .values()
+                            .fold((0, 0), |acc, r| (acc.0 + r.0, acc.1 + r.1));
+                        println!("[Statistics-nps] {}", nps);
+                        println!("[Statistics-evals] {}", evals);
 
-                        *stats = (0, 0);
                         *start_time = Instant::now();
                     }
 
@@ -824,7 +838,7 @@ fn main() {
 
     let tb_link: Arc<Mutex<Option<(String, String)>>> = Arc::new(Mutex::new(None));
 
-    let stats_counters: Arc<Mutex<(usize, usize)>> = Arc::new(Mutex::new((0, 0)));
+    let stats_counters: Arc<Mutex<ClientRates>> = Arc::new(Mutex::new(HashMap::new()));
 
     let start_time: Arc<Mutex<Instant>> = Arc::new(Mutex::new(Instant::now()));
 
