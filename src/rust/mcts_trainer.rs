@@ -133,10 +133,20 @@ pub struct Tree {
     pub virtual_leaves: usize,
 }
 
+static VIRTUAL_LEAVES: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+
+/// Fixes the leaves per step for this process (self-play takes it from run.toml). Must be
+/// called before the first `Tree::new`; panics if the value was already fixed differently.
+pub fn set_virtual_leaves(k: usize) {
+    assert!(k >= 1, "virtual leaves must be >= 1, got {k}");
+    let fixed = *VIRTUAL_LEAVES.get_or_init(|| k);
+    assert_eq!(fixed, k, "virtual leaves already fixed at {fixed}");
+}
+
 /// Leaves each search gathers per `Tree::step` before waiting for their evaluations, from
-/// `TZ_VIRTUAL_LEAVES` (default 1, i.e. plain sequential MCTS). Read once per process.
+/// `TZ_VIRTUAL_LEAVES` (default 1, i.e. plain sequential MCTS) unless `set_virtual_leaves`
+/// fixed it first. Read once per process.
 pub fn virtual_leaves_from_env() -> usize {
-    static VIRTUAL_LEAVES: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *VIRTUAL_LEAVES.get_or_init(|| match std::env::var("TZ_VIRTUAL_LEAVES") {
         Ok(value) => match value.trim().parse::<usize>() {
             Ok(k) if k >= 1 => k,

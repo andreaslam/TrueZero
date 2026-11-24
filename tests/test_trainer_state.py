@@ -19,10 +19,10 @@ from lib.logger import Logger
 import client
 import network
 
-# Short enough that the tests cross the warm-up and a drop.
-SCHEDULE_ENV = {
-    "TZ_LR_SCHEDULE": "0:1e-3,20K:5e-4",
-    "TZ_LR_WARMUP_SAMPLES": "8K",
+# Short enough that the tests cross the warm-up and a drop (run.toml [trainer] values).
+SCHEDULE = {
+    "LR_SCHEDULE": "0:1e-3,20K:5e-4",
+    "LR_WARMUP_SAMPLES": "8K",
 }
 
 
@@ -78,7 +78,7 @@ def assert_same_weights(test, a, b):
         test.assertTrue(torch.equal(a[k], b[k]), k)
 
 
-@mock.patch.dict(os.environ, SCHEDULE_ENV)
+@mock.patch.multiple(client, **SCHEDULE)
 class TrainerStateTests(unittest.TestCase):
     def setUp(self):
         self.dir = tempfile.mkdtemp()
@@ -93,7 +93,7 @@ class TrainerStateTests(unittest.TestCase):
         """Train from the accepted net, then checkpoint as full_train_and_send does."""
         model = scripted_net(seed=0)
         op = client.create_optimizer(model)
-        schedule = client.LrSchedule.from_env()
+        schedule = client.LrSchedule.from_config()
         train_steps(model, op, schedule, steps=3, seed=1)
         self.assertTrue(
             client.save_trainer_state(
@@ -172,7 +172,7 @@ class TrainerStateTests(unittest.TestCase):
 
     def test_bad_schedule_setting_is_an_error_not_a_bad_checkpoint(self):
         self.trained_and_saved()
-        with mock.patch.dict(os.environ, {"TZ_LR_SCHEDULE": "10K:1e-3"}):
+        with mock.patch.object(client, "LR_SCHEDULE", "10K:1e-3"):
             with self.assertRaises(ValueError):
                 self.fresh_load(accepted_gen=5)
 
@@ -188,7 +188,7 @@ class TrainerStateTests(unittest.TestCase):
         ):
             self.assertFalse(
                 client.save_trainer_state(
-                    model, op, client.LrSchedule.from_env(), 6, 7, self.path
+                    model, op, client.LrSchedule.from_config(), 6, 7, self.path
                 )
             )
 
@@ -205,7 +205,7 @@ class TrainerStateTests(unittest.TestCase):
         path = os.path.join(self.dir, "missing_dir", "trainer_state.pt")
         self.assertFalse(
             client.save_trainer_state(
-                model, op, client.LrSchedule.from_env(), 5, 6, path
+                model, op, client.LrSchedule.from_config(), 5, 6, path
             )
         )
 
@@ -268,10 +268,7 @@ class LrScheduleTests(unittest.TestCase):
                 client.parse_lr_schedule(bad)
 
     def test_defaults_parse_and_start_in_warmup(self):
-        with mock.patch.dict(os.environ, {}, clear=False):
-            os.environ.pop("TZ_LR_SCHEDULE", None)
-            os.environ.pop("TZ_LR_WARMUP_SAMPLES", None)
-            schedule = client.LrSchedule.from_env()
+        schedule = client.LrSchedule.from_config()
         self.assertEqual(schedule.points[0], (0, 1e-3))
         self.assertGreater(schedule.warmup_samples, 0)
         self.assertLess(schedule.lr(), 1e-3)

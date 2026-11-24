@@ -11,6 +11,8 @@ use std::{
     num::NonZeroUsize,
     panic,
     path::Path,
+    process,
+    sync::{Arc, Mutex},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 use tzrust::{
@@ -20,13 +22,11 @@ use tzrust::{
     debug_print,
     executor::{executor_main, partial_batch_timeout, Packet, TEMP_NETWORK_PREFIX},
     fileformat::BinaryOutput,
-    mcts_trainer::{EvalMode, TypeRequest::TrainerSearch},
+    mcts_trainer::set_virtual_leaves,
     message_types::{DataFileType, Entity, MessageServer, MessageType, Statistics},
+    runconfig::{append_jsonl, sha256_hex, start_run, StartIdentity},
     selfplay::{CollectorMessage, DataGen},
-    settings::{
-        CPUCTSettings, FPUSettings, MovesLeftSettings, PSTSettings, PlayoutCapSettings,
-        SearchSettings,
-    },
+    settings::SearchSettings,
     utils::directory_exists,
 };
 
@@ -59,30 +59,13 @@ fn env_usize(name: &str, default: usize) -> usize {
     }
 }
 
-/// Playout cap randomisation settings. Defaults follow KataGo's early run (25% full
-/// searches, fast searches capped at 200 visits). `TZ_PCR_FULL_PROB=1` turns it off, so every
-/// move is a full search; `TZ_PCR_EARLY_STOP=0` disables early stopping of fast searches.
-fn playout_cap_from_env() -> Option<PlayoutCapSettings> {
-    let full_search_prob = match env::var("TZ_PCR_FULL_PROB") {
-        Ok(value) => value
-            .trim()
-            .parse::<f32>()
-            .unwrap_or_else(|_| panic!("TZ_PCR_FULL_PROB must be a number, got {value:?}")),
-        Err(_) => 0.25,
-    };
-    if full_search_prob >= 1.0 {
-        return None;
-    }
-    let fast_visits = env_usize("TZ_PCR_FAST_VISITS", 200) as u32;
-    let early_stop = env::var("TZ_PCR_EARLY_STOP").map_or(true, |v| v.trim() != "0");
-    Some(PlayoutCapSettings::new(
-        full_search_prob,
-        fast_visits,
-        early_stop,
-    ))
-}
-
 fn main() {
+    // run.toml, the run lock and the start log come first: a refused start does nothing else.
+    let (run_cfg, run_identity) = start_run("datagen");
+    set_virtual_leaves(run_cfg.selfplay.virtual_leaves);
+    let search_settings = run_cfg.search_settings();
+    let playout_cap = run_cfg.playout_cap();
+
     tch::set_num_threads(1);
     tch::set_num_interop_threads(1);
     let logical_cpus = num_cpus::get();
@@ -139,12 +122,15 @@ fn main() {
 
     // Two executors on one GPU let one thread pack and unpack its batch on the CPU while the
     // other's batch runs on the GPU; with one executor the GPU idles during the CPU phases.
-    // Both settings can be overridden without rebuilding, for A/B throughput tests.
+    // Throughput only, so it stays an env var (A/B tests without touching run.toml).
     let num_executors = env_usize("TZ_NUM_EXECUTORS", 2);
     let batch_size = 2048;
     // Independent of `num_executors`, so changing the executor count changes one thing only.
-    // More generators than it takes to fill the batches only lengthens every game.
-    let num_generators = env_usize("TZ_NUM_GENERATORS", 2 * batch_size);
+    // More generators than it takes to fill the batches only lengthens every game, so it
+    // changes the data and lives in run.toml.
+    let num_generators = run_cfg.selfplay.num_generators;
+    // Checksum of the net self-play is using, for the provenance log.
+    let current_net: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
     println!(
         "[Datagen] {num_executors} executor(s), {num_generators} generators, \
          batch size {batch_size}, partial-batch timeout {:?}",
@@ -166,6 +152,7 @@ fn main() {
         let (id_send, id_recv) = flume::bounded::<usize>(1);
         let (executor_ready_send, executor_ready_recv) = flume::unbounded::<bool>();
 
+        let commander_net = current_net.clone();
         let _ = s
             .builder()
             .name("commander".to_string())
@@ -176,6 +163,7 @@ fn main() {
                     id_send,
                     executor_ready_recv,
                     num_executors,
+                    commander_net,
                 )
             })
             .unwrap();
@@ -203,7 +191,6 @@ fn main() {
                 .unwrap();
         }
 
-        let playout_cap = playout_cap_from_env();
         println!("[Datagen] playout cap randomisation: {playout_cap:?}");
         for n in 0..num_generators {
             let sender_clone = game_sender.clone();
@@ -213,7 +200,14 @@ fn main() {
             };
             let tensor_exe_send_clone = tensor_exe_send.clone();
             let fut_generator = async move {
-                generator_main(sender_clone, selfplay_master, tensor_exe_send_clone, n).await;
+                generator_main(
+                    sender_clone,
+                    selfplay_master,
+                    tensor_exe_send_clone,
+                    n,
+                    search_settings,
+                )
+                .await;
             };
             pool.spawn_ok(fut_generator);
         }
@@ -226,6 +220,8 @@ fn main() {
                     &game_receiver,
                     &mut stream.try_clone().expect("clone failed"),
                     id_recv,
+                    &run_identity,
+                    &current_net,
                 )
             })
             .unwrap();
@@ -238,35 +234,8 @@ async fn generator_main(
     datagen: DataGen,
     tensor_exe_send: Sender<Packet>,
     id: usize,
+    settings: SearchSettings,
 ) {
-    let m_settings = MovesLeftSettings {
-        moves_left_weight: 0.05,
-        moves_left_clip: 20.0,
-        moves_left_sharpness: 0.5,
-    };
-
-    let settings: SearchSettings = SearchSettings {
-        fpu: FPUSettings {
-            root_fpu: 1.0,
-            children_fpu: 0.5,
-        },
-        wdl: EvalMode::Wdl,
-        moves_left: Some(m_settings),
-        c_puct: CPUCTSettings {
-            root_c_puct: 2.0,
-            children_c_puct: 2.0,
-        },
-        max_nodes: Some(1600),
-        alpha: 0.03,
-        eps: 0.25,
-        search_type: TrainerSearch(None),
-        pst: PSTSettings {
-            root_pst: 1.5,
-            children_pst: 1.5,
-        },
-        batch_size: 1,
-    };
-
     let nps_sender = sender_collector.clone();
 
     // implement caching
@@ -327,10 +296,26 @@ fn serialise_file_to_bytes(file_path: &str) -> io::Result<Vec<u8>> {
     Ok(buffer)
 }
 
+/// Self-play provenance, a sidecar to the KZero-format files (which are not changed): who
+/// produced each replay file. The trainer records the SHA-256 of every .bin it receives, so
+/// a file joins back to its generator, run, config, commit and net on `bin_sha256`.
+fn provenance_path() -> std::path::PathBuf {
+    data_path("hidden/provenance/datagen.jsonl")
+}
+
+fn unix_time() -> f64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs_f64())
+        .unwrap_or(0.0)
+}
+
 fn collector_main(
     receiver: &Receiver<CollectorMessage>,
     server_handle: &mut TcpStream,
     id_recv: Receiver<usize>,
+    run_identity: &StartIdentity,
+    current_net: &Mutex<Option<String>>,
 ) {
     let _thread_name = std::thread::current()
         .name()
@@ -346,6 +331,19 @@ fn collector_main(
         println!("created {}", folder_name.display());
     }
     let id = id_recv.recv().unwrap();
+    append_jsonl(
+        &provenance_path(),
+        &serde_json::json!({
+            "event": "start",
+            "time": unix_time(),
+            "generator_id": id,
+            "pid": process::id(),
+            "run_id": run_identity.run.run_id,
+            "config_sha256": run_identity.config_sha256,
+            "git_sha": run_identity.git_sha,
+            "git_dirty": run_identity.git_dirty,
+        }),
+    );
     let (mut path, mut bin_output) = new_game_file(id);
     let mut nps_start_time = Instant::now();
     let mut nps_vec: Vec<usize> = Vec::new();
@@ -382,6 +380,21 @@ fn collector_main(
                         file_data[0].clone(),
                         file_data[1].clone(),
                         file_data[2].clone(),
+                    );
+                    append_jsonl(
+                        &provenance_path(),
+                        &serde_json::json!({
+                            "event": "file",
+                            "time": unix_time(),
+                            "generator_id": id,
+                            "run_id": run_identity.run.run_id,
+                            "config_sha256": run_identity.config_sha256,
+                            "git_sha": run_identity.git_sha,
+                            "net_sha256": *current_net.lock().unwrap(),
+                            "bin_sha256": sha256_hex(&bin_file),
+                            "games": bin_output.game_count(),
+                            "positions": bin_output.position_count(),
+                        }),
                     );
 
                     let message = MessageServer {
@@ -454,6 +467,7 @@ fn commander_main(
     id_sender: Sender<usize>,
     executor_ready_receiver: Receiver<bool>,
     num_executors: usize,
+    current_net: Arc<Mutex<Option<String>>>,
 ) {
     let mut curr_net = String::new();
     let mut is_initialised = false;
@@ -585,6 +599,7 @@ fn commander_main(
             }
 
             curr_net = net_path.clone();
+            *current_net.lock().unwrap() = curr_net_checksum.clone();
         }
         if net_path.is_empty() {
             // actively request for net path

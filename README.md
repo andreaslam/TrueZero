@@ -153,6 +153,53 @@ Other settings:
 
 All data (`nets/`, `games/`, `hidden/`, `python_client_games/`, `log.npz`) is read from and written to the project root automatically, regardless of where you launch each process.
 
+## Training runs: run.toml, telemetry and the anchor ladder
+
+A training run is a data root (the project root, or `$env:TZ_DATA_ROOT`) holding
+`run.toml`, `nets/`, `games/`, `hidden/` and `python_client_games/`. Before the first start:
+
+```powershell
+Copy-Item run.example.toml run.toml    # into the data root; edit run_id and anything else
+Copy-Item observe.example.toml observe.toml   # optional: W&B, log tailing, ladder
+```
+
+**run.toml is what the run is.** Self-play (`main`) and the trainer (`client.py`) both read
+it; every key is required. The first process to start writes `hidden/run_lock.json` with the
+run_id, the SHA-256 of run.toml and the git commit. Later starts are refused if run.toml
+changed, the code is at another commit, or the run_id differs. Uncommitted changes only
+warn (each start's `git_dirty` is logged). `--allow-config-change` / `--allow-code-change` override the first two and
+are recorded in `hidden/run_log.jsonl`. The old `TZ_NUM_GENERATORS`, `TZ_VIRTUAL_LEAVES`,
+`TZ_PCR_*` and `TZ_LR_*` variables are ignored with a warning (`Remove-Item
+Env:TZ_PCR_FULL_PROB` silences it).
+`TZ_NUM_EXECUTORS` and `TZ_BATCH_TIMEOUT_US` stay env vars: they only change throughput.
+
+A branch of a run (same commit, different hyperparameters) is a new data root with its own
+run.toml: a new `run_id`, `parent_run_id` set to the parent and `fork_sample` to the samples
+trained at the fork point, starting from a copy of the parent's net and
+`hidden/trainer_state.pt`. Branches never share replay files.
+
+Provenance: `hidden/provenance/datagen.jsonl` (self-play: generator, run, config, commit,
+net for each replay file) and `hidden/provenance/trainer.jsonl` (trainer: each received
+file) join on `bin_sha256`.
+
+**observe.toml is how the run is watched** and can change any time:
+
+- `[wandb]`: on by default (`mode = "online"`, project `truezero`, your default entity,
+  run name = `run_id`, group = `parent_run_id` or `run_id`). Log in once with
+  `uv run wandb login`; without a login the trainer logs offline rather than prompting
+  (`wandb sync hidden/wandb/offline-run-*` uploads later). `mode = "off"` disables it. Metrics
+  are plotted against samples trained: losses, policy accuracy (full searches only),
+  policy entropy, LR, buffer age, gate results, per-file game length, draw rate and the
+  first-move distribution, and (with `[tail]`) nodes/s, evals/s and executor timings
+  parsed from the Rust logs (`.\server.exe | Tee-Object logs\server.log`).
+- `[ladder]`: every N accepted nets the trainer runs `ladder` (build it with
+  `cargo build --release --bin ladder`) in the background: fixed-node matches against
+  frozen anchors (a copied net such as `anchors/tz_18.pt`, `random`, or
+  `stockfish:<path>:<skill>`), giving Elo against things that never change, plus the
+  bundled mate-in-1/2 suite (`src/python/eval/mate_suite.txt`) as % solved. Results go
+  to W&B (`ladder/*`) and `hidden/ladder.jsonl`. `uv run python src/python/ladder.py
+  nets/tz_40.pt` evaluates nets by hand.
+
 ## Running the Engine in UCI
 
 To use TrueZero through UCI, run the following from `src/rust`:

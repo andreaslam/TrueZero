@@ -26,6 +26,7 @@ pub mod mcts;
 pub mod mcts_trainer;
 pub mod message_types;
 pub mod mvs;
+pub mod runconfig;
 pub mod selfplay;
 pub mod settings;
 pub mod uci;

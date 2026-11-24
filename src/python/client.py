@@ -1,8 +1,10 @@
+import argparse
 import hashlib
 import io
 import json
 import os
 import queue
+import random
 import re
 import socket
 import threading
@@ -24,6 +26,18 @@ from lib.logger import Logger
 from lib.loop import LoopBuffer
 from lib.train import ScalarTarget, TrainSettings
 from paths import data_dir, data_path
+from ladder import LadderRunner
+from runconfig import record_received_file, start_run
+from telemetry import (
+    LogTailer,
+    SelfplayHealth,
+    Telemetry,
+    buffer_row,
+    gate_row,
+    load_observe_config,
+    logger_row,
+    resolve_data_paths,
+)
 from torch import optim
 
 
@@ -144,6 +158,28 @@ def policy_target_fraction(batch):
     return has_target.float().mean().item()
 
 
+def policy_entropy_row(model, batch, prefix):
+    """Mean entropy (nats) of the net's policy over legal moves and of the search target,
+    over positions with a policy target (full searches). A net whose entropy collapses
+    far below the target's is overconfident; one stuck high is not learning the policy."""
+    scalars, logits = model(batch.input_full)
+    has_target = (batch.policy_values != -1).any(dim=1)
+    if not has_target.any():
+        return {}
+    legal = batch.policy_values != -1
+    picked = torch.gather(logits.flatten(1), 1, batch.policy_indices)
+    picked = picked.masked_fill(~legal, float("-inf"))
+    logp = torch.log_softmax(picked[has_target], dim=1)
+    p = logp.exp()
+    net_h = -(p * logp.masked_fill(~legal[has_target], 0.0)).sum(dim=1).mean()
+    target = batch.policy_values[has_target].clamp(min=0.0)
+    target_h = -(target * torch.log(target.clamp(min=1e-12))).sum(dim=1).mean()
+    return {
+        f"policy-entropy/{prefix} net": net_h.item(),
+        f"policy-entropy/{prefix} target": target_h.item(),
+    }
+
+
 def set_policy_weight(train_settings, batch):
     """Keep the policy's share of the loss independent of how many positions are masked.
 
@@ -160,6 +196,8 @@ def set_policy_weight(train_settings, batch):
 HOST = os.environ.get("TZ_SERVER_HOST", "127.0.0.1")
 PORT = int(os.environ.get("TZ_SERVER_PORT", "38475"))
 
+# The training hyperparameters below are the defaults (equal to run.example.toml);
+# main() replaces them with the run's run.toml through apply_run_config.
 BUFFER_SIZE = 1500000
 BATCH_SIZE = 2048
 
@@ -185,6 +223,16 @@ MIN_TRAINING_STEPS = 16
 # Instead, perform a small bootstrap session over the full replay buffer.
 STARTUP_TRAINING_STEPS = 16
 
+TEST_FRACTION = 0.2
+WEIGHT_DECAY = 1e-4
+LOSS_WEIGHTS = {
+    "value_weight": 1.0,
+    "wdl_weight": 1.0,
+    "moves_left_weight": 0.1,
+    "moves_left_delta": 0.1,
+    "clip_norm": 5.0,
+}
+
 assert BATCH_SIZE > 0 and (BATCH_SIZE & (BATCH_SIZE - 1)) == 0
 
 data_dir("hidden")
@@ -197,13 +245,30 @@ TRAINER_STATE_VERSION = 1
 
 LAST_SENT_NET_CHECKSUM = None
 
+# This trainer's run identity (runconfig.StartIdentity), set by main().
+RUN_IDENTITY = None
+
+# Optional W&B telemetry (telemetry.py), set by main(); None in tests and tools.
+TELEMETRY = None
+SELFPLAY_HEALTH = SelfplayHealth()
+
+
+def telemetry_log(row_fn):
+    """Log `row_fn()` if telemetry is on. Metrics must never stop training."""
+    if TELEMETRY is None or not TELEMETRY.enabled:
+        return
+    try:
+        TELEMETRY.log(row_fn())
+    except Exception as e:
+        print(f"[telemetry][Warning] {e!r}")
+
 
 def create_optimizer(model):
     # The learning rate is set before every step by LrSchedule.apply.
     return optim.AdamW(
         params=model.parameters(),
         lr=1e-3,
-        weight_decay=1e-4,
+        weight_decay=WEIGHT_DECAY,
     )
 
 
@@ -226,14 +291,14 @@ def create_optimizer(model):
 # optimiser. A fresh optimiser starts the schedule at zero, so it warms up
 # again rather than taking full-rate steps from empty Adam moments.
 #
-# Override with environment variables:
-#   TZ_LR_SCHEDULE        "samples:lr,..." piecewise-constant points, starting
-#                         at 0; counts take K/M/B suffixes, e.g. "0:1e-3,50M:5e-4"
-#   TZ_LR_WARMUP_SAMPLES  warm-up length in samples (0 disables warm-up)
+# Set in run.toml [trainer]:
+#   lr_schedule        "samples:lr,..." piecewise-constant points, starting
+#                      at 0; counts take K/M/B suffixes, e.g. "0:1e-3,50M:5e-4"
+#   lr_warmup_samples  warm-up length in samples (0 disables warm-up)
 # ---------------------------------------------------------------------------
 
-DEFAULT_LR_SCHEDULE = "0:1e-3,50M:5e-4,100M:2.5e-4,200M:1e-4"
-DEFAULT_LR_WARMUP_SAMPLES = "1M"
+LR_SCHEDULE = "0:1e-3,50M:5e-4,100M:2.5e-4,200M:1e-4"
+LR_WARMUP_SAMPLES = "1M"
 
 # The warm-up starts at this fraction of the scheduled rate (KataGo: 1/20).
 LR_WARMUP_START_FRACTION = 0.05
@@ -279,12 +344,11 @@ class LrSchedule:
         self.samples_trained = samples_trained
 
     @classmethod
-    def from_env(cls):
+    def from_config(cls):
+        """A schedule at sample 0 from LR_SCHEDULE and LR_WARMUP_SAMPLES (run.toml)."""
         return cls(
-            parse_lr_schedule(os.environ.get("TZ_LR_SCHEDULE", DEFAULT_LR_SCHEDULE)),
-            parse_sample_count(
-                os.environ.get("TZ_LR_WARMUP_SAMPLES", DEFAULT_LR_WARMUP_SAMPLES)
-            ),
+            parse_lr_schedule(LR_SCHEDULE),
+            parse_sample_count(LR_WARMUP_SAMPLES),
         )
 
     def lr(self):
@@ -334,6 +398,15 @@ def scheduled_train_step(train_settings, batch, model, op, schedule, log):
     # Separate group so the plotter does not draw lr against a count in the millions.
     log.log("samples", "trained", schedule.samples_trained)
     log.log("policy-targets", "fraction", fraction)
+    if TELEMETRY is not None:
+        TELEMETRY.set_samples(schedule.samples_trained)
+    telemetry_log(
+        lambda: {
+            **logger_row(log, ("train",), groups=("grad_norm", "param_norm")),
+            "train/lr": lr,
+            "train/policy_target_fraction": fraction,
+        }
+    )
 
 
 def save_trainer_state(model, op, schedule, accepted_gen, candidate_gen, path=None):
@@ -395,13 +468,13 @@ def load_trainer_state(model, accepted_gen, device, path=None):
     """
     path = path or TRAINER_STATE_PATH
 
-    # Parsed outside the try below: a bad TZ_LR_SCHEDULE must stop the trainer,
+    # Parsed outside the try below: a bad lr_schedule must stop the trainer,
     # not be reported as an unreadable checkpoint.
-    LrSchedule.from_env()
+    LrSchedule.from_config()
 
     if not os.path.exists(path):
         print("[Training] No trainer state found; starting a fresh optimiser.")
-        return create_optimizer(model), LrSchedule.from_env()
+        return create_optimizer(model), LrSchedule.from_config()
 
     try:
         state = torch.load(path, map_location=device, weights_only=True)
@@ -422,7 +495,7 @@ def load_trainer_state(model, accepted_gen, device, path=None):
         ):
             raise ValueError("saved weights do not match the network architecture")
 
-        schedule = LrSchedule.from_env()
+        schedule = LrSchedule.from_config()
         schedule.load_state_dict(state["schedule"])
         op = create_optimizer(model)
         op.load_state_dict(state["optimizer"])
@@ -430,7 +503,7 @@ def load_trainer_state(model, accepted_gen, device, path=None):
 
     except Exception as e:
         print(f"[Warning] ignoring trainer state {path}: {e!r}")
-        return create_optimizer(model), LrSchedule.from_env()
+        return create_optimizer(model), LrSchedule.from_config()
 
     print(
         "[Training] Resumed training weights, optimiser and LR schedule from "
@@ -438,6 +511,51 @@ def load_trainer_state(model, accepted_gen, device, path=None):
         f"{schedule.samples_trained:,} samples trained, lr {schedule.lr():.3g})."
     )
     return op, schedule
+
+
+def apply_run_config(cfg):
+    """Set the training hyperparameters from a validated run.toml."""
+    global BUFFER_SIZE, BATCH_SIZE, MIN_BUFFER_TO_TRAIN, EPOCHS_PER_GEN
+    global RECENT_BATCH_FRACTION, MIN_TRAINING_STEPS, STARTUP_TRAINING_STEPS
+    global TEST_FRACTION, LR_SCHEDULE, LR_WARMUP_SAMPLES, WEIGHT_DECAY, POLICY_WEIGHT
+    t = cfg["trainer"]
+    BUFFER_SIZE = t["buffer_size"]
+    BATCH_SIZE = t["batch_size"]
+    MIN_BUFFER_TO_TRAIN = t["min_buffer_to_train"]
+    EPOCHS_PER_GEN = float(t["epochs_per_gen"])
+    RECENT_BATCH_FRACTION = float(t["recent_batch_fraction"])
+    MIN_TRAINING_STEPS = t["min_training_steps"]
+    STARTUP_TRAINING_STEPS = t["startup_training_steps"]
+    TEST_FRACTION = float(t["test_fraction"])
+    LR_SCHEDULE = t["lr_schedule"]
+    LR_WARMUP_SAMPLES = t["lr_warmup_samples"]
+    WEIGHT_DECAY = float(t["weight_decay"])
+    POLICY_WEIGHT = float(t["policy_weight"])
+    for key in LOSS_WEIGHTS:
+        LOSS_WEIGHTS[key] = float(t[key])
+    # Fail now, not at the first training round.
+    LrSchedule.from_config()
+
+
+def seed_everything(seed):
+    random.seed(seed)
+    np.random.seed(seed % 2**32)
+    torch.manual_seed(seed)
+
+
+def parse_args(argv=None):
+    parser = argparse.ArgumentParser(description="TrueZero trainer")
+    parser.add_argument(
+        "--allow-config-change",
+        action="store_true",
+        help="start although run.toml differs from the one the run was locked with",
+    )
+    parser.add_argument(
+        "--allow-code-change",
+        action="store_true",
+        help="start although the code is not at the run's pinned commit",
+    )
+    return parser.parse_args(argv)
 
 
 def receiver_loop(server, message_queue, receiver_stop_event):
@@ -483,6 +601,26 @@ def get_message(message_queue, timeout=0.05):
 
 
 def main():
+    args = parse_args()
+    # run.toml, the run lock and the start log come first: a refused start does nothing else.
+    run_cfg, run_identity = start_run(
+        "trainer",
+        allow_config_change=args.allow_config_change,
+        allow_code_change=args.allow_code_change,
+    )
+    apply_run_config(run_cfg)
+    global RUN_IDENTITY, TELEMETRY
+    RUN_IDENTITY = run_identity
+    observe = load_observe_config()
+    TELEMETRY = Telemetry(observe, run_cfg, run_identity)
+    LogTailer(
+        TELEMETRY,
+        resolve_data_paths(observe["tail"]["logs"]),
+        flush_seconds=float(observe["tail"]["flush_seconds"]),
+    ).start()
+    ladder = LadderRunner(observe["ladder"], TELEMETRY)
+    seed_everything(run_cfg["run"]["seed"])
+
     game = Game.find("chess")
 
     # Select exactly one device.
@@ -542,20 +680,20 @@ def main():
     loopbuf = LoopBuffer(
         game,
         target_positions=BUFFER_SIZE,
-        test_fraction=0.2,
+        test_fraction=TEST_FRACTION,
     )
 
     train_settings = TrainSettings(
         game=game,
         scalar_target=ScalarTarget.Final,
-        value_weight=1.0,
-        wdl_weight=1.0,
-        moves_left_weight=0.1,
-        moves_left_delta=0.1,
+        value_weight=LOSS_WEIGHTS["value_weight"],
+        wdl_weight=LOSS_WEIGHTS["wdl_weight"],
+        moves_left_weight=LOSS_WEIGHTS["moves_left_weight"],
+        moves_left_delta=LOSS_WEIGHTS["moves_left_delta"],
         policy_weight=POLICY_WEIGHT,
         sim_weight=0.0,
         train_in_eval_mode=False,
-        clip_norm=5.0,
+        clip_norm=LOSS_WEIGHTS["clip_norm"],
         mask_policy=True,
     )
 
@@ -667,6 +805,9 @@ def main():
             test_result = extract_test_result(raw_data)
 
             if test_result is not None:
+                if pending_candidate_gen is not None:
+                    telemetry_log(lambda: gate_row(test_result, pending_candidate_gen))
+
                 if pending_candidate_path is None or pending_candidate_gen is None:
                     print("[Training] Ignoring SPRT result with no pending candidate")
 
@@ -682,6 +823,11 @@ def main():
                     )
 
                     print(f"[Training] Candidate accepted: {accepted_model_path}")
+                    # Training is paused while a candidate is pending, so the schedule's
+                    # position is exactly the samples this net was trained on.
+                    ladder.maybe_run(
+                        accepted_model_path, accepted_gen, schedule.samples_trained
+                    )
 
                     pending_candidate_path = None
                     pending_candidate_gen = None
@@ -921,8 +1067,10 @@ def extract_incoming_data_given_bytes(
         f.write(path + "\n")
 
     print(path)
+    record_received_file(path, bin_data, RUN_IDENTITY)
 
     data = load_file(path)
+    telemetry_log(lambda: SELFPLAY_HEALTH.file_row(data))
 
     loopbuf.append(
         log,
@@ -1072,12 +1220,20 @@ def full_train_and_send(
         candidate_gen=starting_gen,
     )
 
-    test_net(
+    entropy = test_net(
         model,
         train_settings,
         log,
         test_sampler,
         last_gen_test_sampler,
+    )
+    telemetry_log(
+        lambda: {
+            **logger_row(log, ("test", "last gen test")),
+            **entropy,
+            **buffer_row(loopbuf),
+            "train/candidate_gen": starting_gen,
+        }
     )
 
     log.finished_data()
@@ -1233,6 +1389,9 @@ def test_net(
             log_prefix="test",
             logger=log,
         )
+        entropy = {}
+        if TELEMETRY is not None and TELEMETRY.enabled:
+            entropy = policy_entropy_row(model, test_batch, "test")
 
         last_gen_test_batch = last_gen_test_sampler.next_batch()
 
@@ -1246,6 +1405,7 @@ def test_net(
 
     test_sampler.close()
     last_gen_test_sampler.close()
+    return entropy
 
 
 def train_net(
@@ -1414,6 +1574,7 @@ def extract_incoming_data_given_path(
         f.write(file_path + "\n")
 
     data = load_file(file_path)
+    telemetry_log(lambda: SELFPLAY_HEALTH.file_row(data))
 
     loopbuf.append(
         log,

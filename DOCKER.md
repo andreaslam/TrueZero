@@ -92,11 +92,14 @@ The following variables are runtime configuration and do not require rebuilding:
 | `TZ_DEVICE` | `auto` in the image, `cuda` in Compose | `auto`, `cpu`, `cuda`, or `mps` |
 | `TZ_COMMAND` | `ucimain` | Rust binary to execute |
 | `TZ_NUM_EXECUTORS` | `2` | Self-play (`main`) inference threads sharing the GPU |
-| `TZ_NUM_GENERATORS` | `4096` | Self-play (`main`) games played concurrently |
 | `TZ_BATCH_TIMEOUT_US` | `1` | Self-play: microseconds an executor waits for one more request before running a partial batch (a gap, not a deadline). `0` = pull batching: a free executor runs everything already queued |
-| `TZ_PCR_FULL_PROB` | `0.25` | Self-play: share of moves given a full search; `1` turns playout cap randomisation off |
-| `TZ_PCR_FAST_VISITS` | `200` | Self-play: visit cap of the other (fast) searches |
-| `TZ_PCR_EARLY_STOP` | `1` | Self-play: `0` stops fast searches from ending early once the move is decided |
+
+Training-run hyperparameters (self-play generators, virtual leaves, PCR, search and trainer
+settings) are no longer environment variables: they live in `/data/run.toml` (copy
+`run.example.toml` from the repository) and the old `TZ_NUM_GENERATORS`, `TZ_VIRTUAL_LEAVES`,
+`TZ_PCR_*` and `TZ_LR_*` variables are ignored with a warning. The image records the commit it was built from
+(`--build-arg TZ_BUILD_GIT_SHA=$(git rev-parse HEAD)`; CI passes it), which pins the run. See
+"Training runs" in the README.
 
 `TZ_DEVICE=cuda` fails explicitly if CUDA is unavailable. `auto` selects CUDA,
 then Apple MPS, then CPU. `TZ_DATA_ROOT` is honored by both Rust and Python,
