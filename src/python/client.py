@@ -27,6 +27,16 @@ from lib.loop import LoopBuffer
 from lib.train import ScalarTarget, TrainSettings
 from paths import data_dir, data_path
 from runconfig import record_received_file, start_run
+from telemetry import (
+    LogTailer,
+    SelfplayHealth,
+    Telemetry,
+    buffer_row,
+    gate_row,
+    load_observe_config,
+    logger_row,
+    resolve_data_paths,
+)
 from torch import optim
 
 
@@ -147,6 +157,28 @@ def policy_target_fraction(batch):
     return has_target.float().mean().item()
 
 
+def policy_entropy_row(model, batch, prefix):
+    """Mean entropy (nats) of the net's policy over legal moves and of the search target,
+    over positions with a policy target (full searches). A net whose entropy collapses
+    far below the target's is overconfident; one stuck high is not learning the policy."""
+    scalars, logits = model(batch.input_full)
+    has_target = (batch.policy_values != -1).any(dim=1)
+    if not has_target.any():
+        return {}
+    legal = batch.policy_values != -1
+    picked = torch.gather(logits.flatten(1), 1, batch.policy_indices)
+    picked = picked.masked_fill(~legal, float("-inf"))
+    logp = torch.log_softmax(picked[has_target], dim=1)
+    p = logp.exp()
+    net_h = -(p * logp.masked_fill(~legal[has_target], 0.0)).sum(dim=1).mean()
+    target = batch.policy_values[has_target].clamp(min=0.0)
+    target_h = -(target * torch.log(target.clamp(min=1e-12))).sum(dim=1).mean()
+    return {
+        f"policy-entropy/{prefix} net": net_h.item(),
+        f"policy-entropy/{prefix} target": target_h.item(),
+    }
+
+
 def set_policy_weight(train_settings, batch):
     """Keep the policy's share of the loss independent of how many positions are masked.
 
@@ -214,6 +246,20 @@ LAST_SENT_NET_CHECKSUM = None
 
 # This trainer's run identity (runconfig.StartIdentity), set by main().
 RUN_IDENTITY = None
+
+# Optional W&B telemetry (telemetry.py), set by main(); None in tests and tools.
+TELEMETRY = None
+SELFPLAY_HEALTH = SelfplayHealth()
+
+
+def telemetry_log(row_fn):
+    """Log `row_fn()` if telemetry is on. Metrics must never stop training."""
+    if TELEMETRY is None or not TELEMETRY.enabled:
+        return
+    try:
+        TELEMETRY.log(row_fn())
+    except Exception as e:
+        print(f"[telemetry][Warning] {e!r}")
 
 
 def create_optimizer(model):
@@ -351,6 +397,15 @@ def scheduled_train_step(train_settings, batch, model, op, schedule, log):
     # Separate group so the plotter does not draw lr against a count in the millions.
     log.log("samples", "trained", schedule.samples_trained)
     log.log("policy-targets", "fraction", fraction)
+    if TELEMETRY is not None:
+        TELEMETRY.set_samples(schedule.samples_trained)
+    telemetry_log(
+        lambda: {
+            **logger_row(log, ("train",), groups=("grad_norm", "param_norm")),
+            "train/lr": lr,
+            "train/policy_target_fraction": fraction,
+        }
+    )
 
 
 def save_trainer_state(model, op, schedule, accepted_gen, candidate_gen, path=None):
@@ -553,8 +608,15 @@ def main():
         allow_code_change=args.allow_code_change,
     )
     apply_run_config(run_cfg)
-    global RUN_IDENTITY
+    global RUN_IDENTITY, TELEMETRY
     RUN_IDENTITY = run_identity
+    observe = load_observe_config()
+    TELEMETRY = Telemetry(observe, run_cfg, run_identity)
+    LogTailer(
+        TELEMETRY,
+        resolve_data_paths(observe["tail"]["logs"]),
+        flush_seconds=float(observe["tail"]["flush_seconds"]),
+    ).start()
     seed_everything(run_cfg["run"]["seed"])
 
     game = Game.find("chess")
@@ -741,6 +803,9 @@ def main():
             test_result = extract_test_result(raw_data)
 
             if test_result is not None:
+                if pending_candidate_gen is not None:
+                    telemetry_log(lambda: gate_row(test_result, pending_candidate_gen))
+
                 if pending_candidate_path is None or pending_candidate_gen is None:
                     print("[Training] Ignoring SPRT result with no pending candidate")
 
@@ -998,6 +1063,7 @@ def extract_incoming_data_given_bytes(
     record_received_file(path, bin_data, RUN_IDENTITY)
 
     data = load_file(path)
+    telemetry_log(lambda: SELFPLAY_HEALTH.file_row(data))
 
     loopbuf.append(
         log,
@@ -1147,12 +1213,20 @@ def full_train_and_send(
         candidate_gen=starting_gen,
     )
 
-    test_net(
+    entropy = test_net(
         model,
         train_settings,
         log,
         test_sampler,
         last_gen_test_sampler,
+    )
+    telemetry_log(
+        lambda: {
+            **logger_row(log, ("test", "last gen test")),
+            **entropy,
+            **buffer_row(loopbuf),
+            "train/candidate_gen": starting_gen,
+        }
     )
 
     log.finished_data()
@@ -1308,6 +1382,9 @@ def test_net(
             log_prefix="test",
             logger=log,
         )
+        entropy = {}
+        if TELEMETRY is not None and TELEMETRY.enabled:
+            entropy = policy_entropy_row(model, test_batch, "test")
 
         last_gen_test_batch = last_gen_test_sampler.next_batch()
 
@@ -1321,6 +1398,7 @@ def test_net(
 
     test_sampler.close()
     last_gen_test_sampler.close()
+    return entropy
 
 
 def train_net(
@@ -1489,6 +1567,7 @@ def extract_incoming_data_given_path(
         f.write(file_path + "\n")
 
     data = load_file(file_path)
+    telemetry_log(lambda: SELFPLAY_HEALTH.file_row(data))
 
     loopbuf.append(
         log,

@@ -1,0 +1,42 @@
+# How a TrueZero run is watched (not what it is): copy to `<data root>/observe.toml`.
+# Unlike run.toml this file is not locked; edit it any time and restart the trainer.
+# Missing file or missing keys = the defaults shown here.
+
+[wandb]
+# "off", "offline" (local files; `wandb sync` later) or "online".
+# Needs the wandb package: `uv sync --group telemetry`.
+mode = "off"
+project = "truezero"
+# W&B team or user; "" = your default entity.
+entity = ""
+
+[tail]
+# Rust stdout logs for the trainer to follow (relative to the data root). Start the
+# processes with their output teed to these files, e.g. in PowerShell:
+#   .\server.exe | Tee-Object -FilePath logs\server.log
+#   .\main.exe   | Tee-Object -FilePath logs\datagen.log
+# [Statistics-nps]/[Statistics-evals] (server) and executor timing lines (main) are
+# averaged and logged every flush_seconds.
+logs = []
+flush_seconds = 60.0
+
+[ladder]
+# Fixed anchor ladder: every `every_accepted_nets` accepted nets, the trainer runs the
+# `ladder` binary in the background: a fixed-node match of the new net against each
+# anchor, and the tactics suite. Results go to W&B as ladder/* and to
+# hidden/ladder.jsonl.
+enabled = false
+every_accepted_nets = 5
+# Path to the ladder binary ("" = src/rust/target/release/ladder[.exe]).
+binary = ""
+# Each anchor: a net path (relative to the data root, e.g. "anchors/tz_18.pt"; copy it
+# there so it never changes), "random" (uniform random legal moves), or
+# "stockfish:<path>:<skill 0-20>" (UCI engine at that skill level, `nodes` per move).
+anchors = ["random"]
+# Games per anchor (colour-swapped pairs from the openings file) and visits per move.
+games = 100
+nodes = 200
+openings = "hidden/8moves_v3.epd"
+# Tactics suite (EPD with bm), "" = the bundled src/python/eval/mate_suite.epd.txt.
+tactics = ""
+tactics_nodes = 400

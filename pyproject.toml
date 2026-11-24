@@ -42,6 +42,10 @@ viz = [
     "pillow>=10",
     "tensorboard>=2.16",
 ]
+# Optional W&B telemetry (observe.toml [wandb]); training runs without it.
+telemetry = [
+    "wandb>=0.19",
+]
 # Misc scripts: experiment.py, trainonly.py, onnx_exporter.py.
 tools = [
     "requests>=2.31",
