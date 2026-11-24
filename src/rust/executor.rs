@@ -1,5 +1,8 @@
 use crate::{
-    debug_print, decoder::eval_state, mcts_trainer::Net, selfplay::CollectorMessage,
+    debug_print,
+    decoder::{eval_state, eval_state_on_device, INPUT_LEN},
+    mcts_trainer::Net,
+    selfplay::CollectorMessage,
     utils::TimeStampDebugger,
 };
 
@@ -13,25 +16,27 @@ use std::{
     process,
     time::{Duration, Instant},
 };
-use tch::Tensor;
+use tch::{Device, Kind, Tensor};
 
 const PARTIAL_BATCH_TIMEOUT: Duration = Duration::from_micros(1);
 pub const TEMP_NETWORK_PREFIX: &str = "tz_temp_net_";
 
 pub struct Packet {
-    pub job: Tensor,
+    /// One position's network input, `INPUT_LEN` floats (see `decoder::board_input`).
+    pub job: Vec<f32>,
     pub resender: Sender<ReturnMessage>,
     pub id: String,
 }
 
 pub struct ExecutorPacket {
-    pub job: VecDeque<Tensor>,
+    pub job: VecDeque<Vec<f32>>,
     pub resenders: VecDeque<Sender<ReturnMessage>>,
     pub id: VecDeque<String>,
 }
 
 pub struct ReturnPacket {
-    pub packet: (Tensor, Tensor),
+    /// (value head row, policy head row) for this position, as raw network outputs.
+    pub packet: (Vec<f32>, Vec<f32>),
     pub id: String,
 }
 
@@ -45,7 +50,7 @@ pub enum Message {
 
 /// Where an executor thread's time goes, summed over one reporting window. Printed every
 /// `STATS_INTERVAL` so a throughput problem can be located without a profiler: a large
-/// `waiting` share means the generators cannot keep the executor fed, large `cat`/`unpack`
+/// `waiting` share means the generators cannot keep the executor fed, large `fill`/`unpack`
 /// shares mean CPU-side batch handling is starving the GPU.
 struct ExecutorStats {
     window_start: Instant,
@@ -112,7 +117,7 @@ impl ExecutorStats {
             let share = |d: Duration| 100.0 * d.as_secs_f64() / secs;
             println!(
                 "[{thread_name}] {:.0}s: {} batches, mean batch {:.0} (min {}, max {}), {:.0} evals/s; \
-                 time: waiting {:.0}%, cat {:.0}%, forward+copy {:.0}%, unpack {:.0}% \
+                 time: waiting {:.0}%, fill {:.0}%, forward+copy {:.0}%, unpack {:.0}% \
                  (slice {:.0}%, send {:.0}%)",
                 secs,
                 self.batches,
@@ -156,14 +161,14 @@ fn handle_requests(
     tensor_receiver: Receiver<Packet>,
     max_batch_size: usize,
 ) {
-    let mut input_vec: VecDeque<Tensor> = VecDeque::new();
+    let mut input_vec: VecDeque<Vec<f32>> = VecDeque::new();
     let mut output_senders: VecDeque<Sender<ReturnMessage>> = VecDeque::new();
     let mut id_vec: VecDeque<String> = VecDeque::new();
     // maximum time a partial batch may wait before being flushed to the GPU. Self-play
     // datagen fills its large batch well within this window, so this only triggers for
     // finite/low-concurrency workloads (e.g. the GateTester match tail), preventing the
     // partial-batch deadlock where the executor waits forever for a batch that never fills.
-    let flush_batch = |input_vec: &mut VecDeque<Tensor>,
+    let flush_batch = |input_vec: &mut VecDeque<Vec<f32>>,
                        output_senders: &mut VecDeque<Sender<ReturnMessage>>,
                        id_vec: &mut VecDeque<String>| {
         if input_vec.is_empty() {
@@ -203,6 +208,86 @@ fn handle_requests(
     }
 }
 
+/// Host-side buffers reused for every batch, so evaluating a batch allocates no large host memory.
+/// This follows Lc0's CUDA backend, which allocates its input and output buffers once with
+/// `cudaHostAlloc`. On CUDA the buffers are pinned, so the copies to and from the GPU go straight
+/// to and from them.
+struct BatchBuffers {
+    capacity: usize,
+    /// `[capacity, INPUT_LEN]`
+    input: Tensor,
+    /// `[capacity, value width]` and `[capacity, policy width]`, created on the first batch, when
+    /// the widths of the network's outputs are known.
+    outputs: Option<(Tensor, Tensor)>,
+    device: Device,
+}
+
+impl BatchBuffers {
+    fn new(capacity: usize, device: Device) -> Self {
+        BatchBuffers {
+            capacity,
+            input: Self::host_buffer(capacity, INPUT_LEN, device),
+            outputs: None,
+            device,
+        }
+    }
+
+    fn host_buffer(rows: usize, width: usize, device: Device) -> Tensor {
+        let t = Tensor::zeros([rows as i64, width as i64], (Kind::Float, Device::Cpu));
+        match device {
+            Device::Cuda(_) => t.pin_memory(device),
+            _ => t,
+        }
+    }
+
+    /// The whole buffer as a flat slice.
+    ///
+    /// Safety: `t` must be one of this struct's buffers (contiguous `f32` on the CPU), and no
+    /// other reference into it may be alive.
+    unsafe fn as_mut_slice(t: &Tensor) -> &mut [f32] {
+        std::slice::from_raw_parts_mut(t.data_ptr() as *mut f32, t.numel())
+    }
+
+    /// Copies the inputs into the start of the input buffer and returns a view of the filled rows.
+    fn fill_input(&mut self, inputs: &[Vec<f32>]) -> Tensor {
+        assert!(inputs.len() <= self.capacity, "batch larger than buffers");
+        let buf = unsafe { Self::as_mut_slice(&self.input) };
+        for (row, input) in buf.chunks_exact_mut(INPUT_LEN).zip(inputs) {
+            assert_eq!(input.len(), INPUT_LEN, "network input has the wrong length");
+            row.copy_from_slice(input);
+        }
+        self.input.narrow(0, 0, inputs.len() as i64)
+    }
+
+    /// Copies the network outputs for `n` positions into the output buffers and returns them as
+    /// flat row-major slices, with the width of each row.
+    fn read_outputs(
+        &mut self,
+        value: &Tensor,
+        policy: &Tensor,
+        n: usize,
+    ) -> (&[f32], usize, &[f32], usize) {
+        let value = value.reshape([n as i64, -1]);
+        let policy = policy.reshape([n as i64, -1]);
+        let (vw, pw) = (value.size()[1] as usize, policy.size()[1] as usize);
+        let (capacity, device) = (self.capacity, self.device);
+        let fits = matches!(&self.outputs, Some((v, p)) if v.size()[1] as usize == vw && p.size()[1] as usize == pw);
+        if !fits {
+            self.outputs = Some((
+                Self::host_buffer(capacity, vw, device),
+                Self::host_buffer(capacity, pw, device),
+            ));
+        }
+        let (v_buf, p_buf) = self.outputs.as_ref().unwrap();
+        // copy_ converts the dtype as well, so a half-precision network also lands as f32
+        v_buf.narrow(0, 0, n as i64).copy_(&value);
+        p_buf.narrow(0, 0, n as i64).copy_(&policy);
+        let v = unsafe { &Self::as_mut_slice(v_buf)[..n * vw] };
+        let p = unsafe { &Self::as_mut_slice(p_buf)[..n * pw] };
+        (v, vw, p, pw)
+    }
+}
+
 pub fn executor_main(
     net_receiver: Receiver<String>,
     tensor_receiver: Receiver<Packet>,
@@ -224,6 +309,7 @@ pub fn executor_main(
 
     let (handler_send, handler_recv) = flume::bounded::<ExecutorPacket>(1);
     let mut stats = ExecutorStats::new();
+    let mut buffers: Option<BatchBuffers> = None;
 
     thread::scope(|s| {
         let _ = s
@@ -271,15 +357,20 @@ pub fn executor_main(
 
                     let network = network.as_mut().expect("Network should be available");
                     let batch_size = input_vec.len();
+                    let buffers = match &mut buffers {
+                        Some(b) if b.device == network.device => b,
+                        slot => slot.insert(BatchBuffers::new(max_batch_size, network.device)),
+                    };
                     let cat_start = Instant::now();
-                    let i_v = input_vec.make_contiguous();
-                    let input_tensors = Tensor::cat(i_v, 0);
+                    let input_tensors = buffers.fill_input(input_vec.make_contiguous());
                     let cat_time = cat_start.elapsed();
 
                     evaluation_time_taken_debugger.reset();
                     let eval_start = Instant::now();
                     let (board_eval, policy) =
-                        eval_state(input_tensors, network).expect("Evaluation failed");
+                        eval_state_on_device(input_tensors, network).expect("Evaluation failed");
+                    let (board_eval, value_width, policy, policy_width) =
+                        buffers.read_outputs(&board_eval, &policy, batch_size);
                     let eval_time = eval_start.elapsed();
                     evaluation_time_taken_debugger.record("evaluation_time_taken", &thread_name);
                     evaluation_time_taken_debugger.reset();
@@ -308,7 +399,10 @@ pub fn executor_main(
                             .pop_front()
                             .expect("There should be an ID for each job");
                         let slice_start = Instant::now();
-                        let result = (board_eval.get(i as i64), policy.get(i as i64));
+                        let result = (
+                            board_eval[i * value_width..(i + 1) * value_width].to_vec(),
+                            policy[i * policy_width..(i + 1) * policy_width].to_vec(),
+                        );
                         let return_pack = ReturnPacket { packet: result, id };
                         let send_start = Instant::now();
                         slice_time += send_start - slice_start;
@@ -398,10 +492,15 @@ pub fn executor_static(
                     let mut output_senders = job.resenders;
 
                     let batch_size = min(max_batch_size, input_vec.len());
-                    let i_v = input_vec.make_contiguous();
-                    let input_tensors = Tensor::cat(&i_v[..batch_size], 0);
+                    let flat: Vec<f32> = input_vec.range(..batch_size).flatten().copied().collect();
                     let (board_eval, policy) =
-                        eval_state(input_tensors, network).expect("Evaluation failed");
+                        eval_state(Tensor::from_slice(&flat), network).expect("Evaluation failed");
+                    let board_eval: Vec<f32> =
+                        Vec::try_from(board_eval.to_kind(Kind::Float).reshape([-1])).unwrap();
+                    let policy: Vec<f32> =
+                        Vec::try_from(policy.to_kind(Kind::Float).reshape([-1])).unwrap();
+                    let value_width = board_eval.len() / batch_size;
+                    let policy_width = policy.len() / batch_size;
                     for i in 0..batch_size {
                         let sender = output_senders
                             .pop_front()
@@ -409,7 +508,10 @@ pub fn executor_static(
                         let id = id_vec
                             .pop_front()
                             .expect("There should be an ID for each job");
-                        let result = (board_eval.get(i as i64), policy.get(i as i64));
+                        let result = (
+                            board_eval[i * value_width..(i + 1) * value_width].to_vec(),
+                            policy[i * policy_width..(i + 1) * policy_width].to_vec(),
+                        );
                         let return_pack = ReturnPacket { packet: result, id };
                         if sender
                             .send(ReturnMessage::ReturnMessage(Ok(return_pack)))

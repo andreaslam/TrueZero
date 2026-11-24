@@ -3,7 +3,7 @@ use crate::{
     cache::CacheEntryKey,
     dataformat::{ZeroEvaluationAbs, ZeroValuesAbs, ZeroValuesPov},
     debug_print,
-    decoder::{convert_board, extract_policy, process_board_output},
+    decoder::{board_input, extract_policy, process_board_output},
     dirichlet::StableDirichlet,
     executor::{Packet, ReturnMessage},
     mvs::get_contents,
@@ -496,7 +496,7 @@ impl Tree {
     ) -> Vec<usize> {
         debug_print!("    eval_and_expand:");
 
-        let input_tensor = convert_board(bs);
+        let input = board_input(bs);
 
         let (resender_send, resender_recv) = flume::bounded::<ReturnMessage>(1);
         let thread_name = std::thread::current()
@@ -504,7 +504,7 @@ impl Tree {
             .unwrap_or("unnamed-generator")
             .to_owned();
         let pack = Packet {
-            job: input_tensor,
+            job: input,
             resender: resender_send,
             id: thread_name.clone(),
         };
@@ -519,7 +519,7 @@ impl Tree {
 
         assert!(thread_name == output.id);
         let idx_li = process_board_output(
-            (&output.packet.0, &output.packet.1),
+            (&output.packet.0[..], &output.packet.1[..]),
             selected_node_idx,
             self,
             bs,

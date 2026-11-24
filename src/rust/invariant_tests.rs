@@ -26,7 +26,6 @@ use crate::{
 use cozy_chess::{Board, Color, Move};
 use lru::LruCache;
 use std::num::NonZeroUsize;
-use tch::Tensor;
 
 // ---- the stub network ----------------------------------------------------------------------
 
@@ -96,12 +95,11 @@ fn spawn_stub(value: StubValue, policy: StubPolicy) -> flume::Sender<Packet> {
     let (send, recv) = flume::unbounded::<Packet>();
     std::thread::spawn(move || {
         for packet in recv.iter() {
-            let input = Vec::<f32>::try_from(packet.job.reshape([-1])).unwrap();
-            let (head, logits) = stub_outputs(&input, value, policy);
+            let (head, logits) = stub_outputs(&packet.job, value, policy);
             let _ = packet
                 .resender
                 .send(ReturnMessage::ReturnMessage(Ok(ReturnPacket {
-                    packet: (Tensor::from_slice(&head), Tensor::from_slice(&logits)),
+                    packet: (head.to_vec(), logits),
                     id: packet.id,
                 })));
         }
@@ -858,4 +856,88 @@ fn pcr2_selfplay_records_full_and_fast_searches() {
         assert_eq!(rec.scalars[3], pos.zero_visits as f32);
         assert_eq!(rec.scalars[4], pos.is_full_search as u8 as f32);
     }
+}
+
+// ---- executor batch path -------------------------------------------------------------------
+
+/// X1: the executor's batch path (reused input buffer, one bulk copy of each output, per-request
+/// slices) hands every request exactly the outputs of its own position, across several batches
+/// that reuse the same buffers, including a partial final batch. Compared with evaluating each
+/// position on its own through `eval_state`, using a real TorchScript network on the CPU.
+#[test]
+fn x1_executor_returns_each_request_its_own_outputs() {
+    use crate::decoder::{board_input, eval_state};
+    use crate::executor::executor_main;
+    use crate::mcts_trainer::Net;
+
+    let net_path = concat!(env!("CARGO_MANIFEST_DIR"), "/../python/nets/tz_6515.pt");
+
+    // 10 distinct positions along one game
+    let mut bs = BoardStack::new(Board::default());
+    let mut positions = vec![bs.clone()];
+    while positions.len() < 10 {
+        let mut moves = Vec::new();
+        bs.board().generate_moves(|m| {
+            moves.extend(m);
+            false
+        });
+        bs.play(moves[positions.len() % moves.len()]);
+        positions.push(bs.clone());
+    }
+
+    let net = Net::new(net_path);
+    let expected: Vec<(Vec<f32>, Vec<f32>)> = positions
+        .iter()
+        .map(|p| {
+            let (v, pol) = eval_state(convert_board(p), &net).unwrap();
+            (
+                Vec::try_from(v.reshape([-1])).unwrap(),
+                Vec::try_from(pol.reshape([-1])).unwrap(),
+            )
+        })
+        .collect();
+
+    let (net_send, net_recv) = flume::unbounded::<String>();
+    let (job_send, job_recv) = flume::unbounded::<Packet>();
+    // batches of at most 4, so 10 requests need at least 3 batches through the same buffers
+    std::thread::spawn(move || executor_main(net_recv, job_recv, 4, None, None, 0));
+    net_send.send(net_path.to_string()).unwrap();
+
+    let receivers: Vec<_> = positions
+        .iter()
+        .enumerate()
+        .map(|(i, p)| {
+            let (tx, rx) = flume::bounded(1);
+            job_send
+                .send(Packet {
+                    job: board_input(p),
+                    resender: tx,
+                    id: format!("request-{i}"),
+                })
+                .unwrap();
+            rx
+        })
+        .collect();
+
+    for (i, (rx, (value, policy))) in receivers.iter().zip(&expected).enumerate() {
+        let ReturnMessage::ReturnMessage(reply) = rx
+            .recv_timeout(std::time::Duration::from_secs(60))
+            .expect("executor did not answer");
+        let reply = reply.unwrap();
+        assert_eq!(reply.id, format!("request-{i}"));
+        let (got_value, got_policy) = reply.packet;
+        assert_eq!(got_value.len(), value.len());
+        assert_eq!(got_policy.len(), policy.len());
+        let max_diff = got_value
+            .iter()
+            .zip(value)
+            .chain(got_policy.iter().zip(policy))
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0_f32, f32::max);
+        assert!(max_diff < 1e-4, "request {i}: outputs differ by {max_diff}");
+    }
+
+    // the executor exits the process once its channels close, so keep them open
+    std::mem::forget(net_send);
+    std::mem::forget(job_send);
 }
