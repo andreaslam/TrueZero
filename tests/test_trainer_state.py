@@ -31,6 +31,15 @@ def scripted_net(seed, num_hidden=8):
     return torch.jit.script(network.TrueNetXS(num_resBlocks=1, num_hidden=num_hidden))
 
 
+class FullSearchBatch:
+    """A one-position batch whose position has a policy target."""
+
+    policy_values = torch.tensor([[1.0]])
+
+    def __len__(self):
+        return 1
+
+
 class StubTrainSettings:
     """Stand-in for TrainSettings: a deterministic AdamW step in train mode."""
 
@@ -55,7 +64,7 @@ def train_steps(model, op, schedule, steps, seed):
     log = Logger()
     for _ in range(steps):
         log.start_batch()
-        client.scheduled_train_step(settings, None, model, op, schedule, log)
+        client.scheduled_train_step(settings, FullSearchBatch(), model, op, schedule, log)
     return settings.lrs_seen
 
 
@@ -240,7 +249,7 @@ class LrScheduleTests(unittest.TestCase):
         log = Logger()
         log.start_batch()
 
-        client.scheduled_train_step(settings, None, model, op, schedule, log)
+        client.scheduled_train_step(settings, FullSearchBatch(), model, op, schedule, log)
 
         self.assertEqual(settings.lrs_seen, [2e-3])
         self.assertEqual(log.data[("schedule", "lr")][0], 2e-3)
