@@ -131,6 +131,24 @@ class TelemetryTests(unittest.TestCase):
         self.assertEqual(root.init_kwargs["group"], "base")
         self.assertNotEqual(root.init_kwargs["id"], wandb_id)  # never the branch's run
 
+    def test_wandb_git_and_code_inference_is_off(self):
+        """wandb's own git/code inference crashes on Windows mapped drives (relpath across
+        mounts); the trainer turns it off unless the user set the variables themselves."""
+        seen = {}
+
+        class Recording(FakeWandb):
+            def init(self, **kwargs):
+                seen.update(
+                    {k: os.environ.get(k) for k in ("WANDB_DISABLE_GIT", "WANDB_DISABLE_CODE")}
+                )
+                return super().init(**kwargs)
+
+        with mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("WANDB_DISABLE_GIT", None)
+            os.environ["WANDB_DISABLE_CODE"] = "false"
+            online(Recording())
+        self.assertEqual(seen, {"WANDB_DISABLE_GIT": "true", "WANDB_DISABLE_CODE": "false"})
+
     def test_a_failing_wandb_never_raises(self):
         fake = FakeWandb()
         t = online(fake)

@@ -65,6 +65,8 @@ uv sync
 
 This creates `.venv/` with Python 3.12 (from `.python-version`) and every default dependency group: `torch`, `gui` (training plots, GUI), `viz` (visualisation, TensorBoard) and `tools`. Run scripts with `uv run`, e.g. `uv run python client.py`, or activate `.venv` first. To install only the libtorch version the Rust `tch` crate is built against (what the Docker image uses), run `uv sync --no-default-groups --group tch`.
 
+If the repository is on a network drive (e.g. `U:\` mapped to `\\server\home`), keep the venv on a local disk: DLLs such as numpy's often fail to load from a share. In PowerShell, `$env:UV_PROJECT_ENVIRONMENT = "C:\venvs\truezero"` before `uv sync` and `uv run` (set it once for good with `[Environment]::SetEnvironmentVariable("UV_PROJECT_ENVIRONMENT", "C:\venvs\truezero", "User")`).
+
 ## Setting environment variables
 
 Set the following environment variables to configure `tch-rs` before running anything (or `source script.sh`).
@@ -186,7 +188,9 @@ file) join on `bin_sha256`.
 
 - `[wandb]`: on by default (`mode = "online"`, project `truezero`, your default entity,
   run name = `run_id`, group = `parent_run_id` or `run_id`). Log in once with
-  `uv run wandb login`; without a login the trainer logs offline rather than prompting
+  `uv run wandb login` (on a network drive, where it fails with "path is on mount 'U:', start
+  on mount '\\server…'", run `$env:WANDB_DISABLE_GIT = "true"` first; the trainer sets
+  this itself); without a login the trainer logs offline rather than prompting
   (`wandb sync hidden/wandb/offline-run-*` uploads later). `mode = "off"` disables it. Metrics
   are plotted against samples trained: losses, policy accuracy (full searches only),
   policy entropy, LR, buffer age, gate results, per-file game length, draw rate and the
