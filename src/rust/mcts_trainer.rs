@@ -298,7 +298,17 @@ impl Tree {
         }
 
         if let TypeRequest::UCISearch = self.settings.search_type {
-            let cp_eval = eval_in_cp(self.nodes[selected_node].net_evaluation.value);
+            // UCI scores are from the side to move's point of view: use the root's search value
+            // (the tree stores absolute values) rather than the latest leaf's network value.
+            let root = &self.nodes[0];
+            let root_rel = root
+                .total_evaluation
+                .to_relative(self.board.board().side_to_move());
+            let root_q = match self.settings.wdl {
+                EvalMode::Wdl => root_rel.wdl.w - root_rel.wdl.l,
+                EvalMode::Value => root_rel.value,
+            } / root.visits as f32;
+            let cp_eval = eval_in_cp(root_q);
             let elapsed_ms = sw.elapsed().as_nanos() as f32 / 1e6;
             let nps = self.nodes[0].visits as f32 / (sw.elapsed().as_nanos() as f32 / 1e9_f32);
             let (pv, mate) = self.get_pv();
