@@ -15,7 +15,6 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-import books
 import client
 import paths
 import runconfig
@@ -178,63 +177,6 @@ class RunTests(unittest.TestCase):
         self.assertIn("r2", client.run_change(reset, me))
         self.assertIsNone(client.run_change({"purpose": {"RequestingNet": []}}, me))
         self.assertIsNone(client.run_change({"purpose": "x"}, me))
-
-
-class BookTests(unittest.TestCase):
-    PGN = (
-        '[Event "?"]\n\n1. e4 e5 2. Nf3 Nc6 *\n\n'
-        '[Event "?"]\n\n1. d4 d5 *\n'
-    )
-
-    def setUp(self):
-        self.dir = Path(tempfile.mkdtemp())
-        self.addCleanup(shutil.rmtree, self.dir)
-
-    @staticmethod
-    def zipped(name, text):
-        import io
-        import zipfile
-
-        buf = io.BytesIO()
-        with zipfile.ZipFile(buf, "w") as z:
-            z.writestr(name, text)
-        return buf.getvalue()
-
-    def test_epd_archive(self):
-        dest = self.dir / "books" / "x.epd"
-        fen = "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1"
-        how = books.ensure_book(dest, fetch=lambda url: self.zipped("x.epd", fen + "\n"))
-        self.assertIn("downloaded", how)
-        self.assertEqual(dest.read_text().strip(), fen)
-
-    def test_pgn_only_book_is_converted_to_fens(self):
-        """official-stockfish/books publishes 8moves_v3 only as a PGN."""
-        import urllib.error
-
-        seen = []
-
-        def fetch(url):
-            seen.append(url)
-            if url.endswith(".epd.zip"):
-                raise urllib.error.HTTPError(url, 404, "Not Found", None, None)
-            return self.zipped("x.pgn", self.PGN)
-
-        dest = self.dir / "x.epd"
-        with mock.patch.object(books, "REPO_ROOT", self.dir):
-            how = books.ensure_book(dest, fetch=fetch)
-        self.assertIn("converted 2 games", how)
-        self.assertTrue(seen[1].endswith("/x.pgn.zip"))
-        lines = dest.read_text().splitlines()
-        self.assertEqual(
-            lines[0], "r1bqkbnr/pppp1ppp/2n5/4p3/4P3/5N2/PPPP1PPP/RNBQKB1R w KQkq - 2 3"
-        )
-        self.assertEqual(len(lines[1].split()), 6)  # full FEN, as Board::from_fen needs
-
-    def test_existing_book_is_left_alone(self):
-        dest = self.dir / "x.epd"
-        dest.write_text("mine\n")
-        self.assertEqual(books.ensure_book(dest, fetch=None), "present")
-        self.assertEqual(dest.read_text(), "mine\n")
 
 
 class ProvenanceTests(unittest.TestCase):

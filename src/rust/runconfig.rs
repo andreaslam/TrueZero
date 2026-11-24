@@ -61,10 +61,10 @@ pub const RETIRED_ENV_VARS: [(&str, &str); 8] = [
 ];
 
 /// The repository root (two levels above this crate).
-/// Not canonicalised on purpose: on Windows that turns a mapped drive (U:) into its UNC
-/// path, which some tools mishandle.
+/// `..` is resolved lexically, not canonicalised: on Windows canonicalising turns a mapped
+/// drive (U:) into its UNC path, which some tools mishandle.
 pub fn repo_root() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join("..").join("..")
+    crate::books::normalise(&Path::new(env!("CARGO_MANIFEST_DIR")).join("..").join(".."))
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]

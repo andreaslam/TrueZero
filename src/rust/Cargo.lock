@@ -2499,6 +2499,8 @@ dependencies = [
  "tch",
  "tokio",
  "toml",
+ "ureq",
+ "zip",
 ]
 
 [[package]]

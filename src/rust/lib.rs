@@ -14,6 +14,7 @@ pub fn data_path_str(rel: &str) -> String {
 }
 
 pub mod boardmanager;
+pub mod books;
 pub mod cache;
 pub mod dataformat;
 pub mod decoder;
