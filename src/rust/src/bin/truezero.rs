@@ -72,15 +72,110 @@ struct Launcher {
     console: Arc<Mutex<()>>,
 }
 
+/// The program (and its leading arguments) that runs the trainer, found without relying on
+/// PATH: a terminal opened before uv was installed does not have it on PATH yet.
+///
+/// The first word of `[launcher] python` is looked up on PATH, then in the folders installers
+/// put it in (`~/.local/bin`, `~/.cargo/bin`, ...). If it is `uv` and cannot be found, the
+/// virtual environment's own Python (`[launcher] venv`, else UV_PROJECT_ENVIRONMENT, else
+/// `.venv` in the repository) runs the script directly.
+fn trainer_program(python: &[String], venv: &str) -> Result<(PathBuf, Vec<String>), String> {
+    let (first, rest) = python
+        .split_first()
+        .ok_or("[launcher] python is empty")?;
+    if let Some(found) = find_program(first) {
+        return Ok((found, rest.to_vec()));
+    }
+    let is_uv = Path::new(first).file_stem().and_then(|s| s.to_str()) == Some("uv");
+    if is_uv && rest.first().map(String::as_str) == Some("run") {
+        let env_dir = if !venv.is_empty() {
+            PathBuf::from(venv)
+        } else if let Some(v) = std::env::var_os("UV_PROJECT_ENVIRONMENT") {
+            PathBuf::from(v)
+        } else {
+            repo_root().join(".venv")
+        };
+        let py = if cfg!(windows) {
+            env_dir.join("Scripts").join("python.exe")
+        } else {
+            env_dir.join("bin").join("python")
+        };
+        if py.is_file() {
+            // `uv run python X` == `<venv python> X`; `uv run X` (a script) likewise.
+            let mut args: Vec<String> = rest[1..].to_vec();
+            if args.first().map(String::as_str) == Some("python") {
+                args.remove(0);
+            }
+            println!(
+                "[truezero] uv is not on PATH; running the trainer with {}",
+                py.display()
+            );
+            return Ok((py, args));
+        }
+        return Err(format!(
+            "uv is not installed (looked on PATH and in ~/.local/bin, ~/.cargo/bin) and there is \
+             no virtual environment at {}. Install uv (https://docs.astral.sh/uv/) and run \
+             `uv sync` in the repository, or set [launcher] venv in truezero.toml.",
+            env_dir.display()
+        ));
+    }
+    Err(format!(
+        "{first} was not found on PATH or in ~/.local/bin, ~/.cargo/bin; check [launcher] python \
+         in truezero.toml"
+    ))
+}
+
+/// `name` as an existing file: as given if it is a path, else on PATH, else in the usual
+/// per-user install folders.
+fn find_program(name: &str) -> Option<PathBuf> {
+    let with_suffix = |p: PathBuf| -> Option<PathBuf> {
+        if p.is_file() {
+            return Some(p);
+        }
+        let mut s = p.into_os_string();
+        s.push(std::env::consts::EXE_SUFFIX);
+        let p = PathBuf::from(s);
+        p.is_file().then_some(p)
+    };
+    let as_path = Path::new(name);
+    if as_path.components().count() > 1 || as_path.is_absolute() {
+        return with_suffix(as_path.to_path_buf());
+    }
+    let mut dirs: Vec<PathBuf> = std::env::var_os("PATH")
+        .map(|p| std::env::split_paths(&p).collect())
+        .unwrap_or_default();
+    for var in ["UV_INSTALL_DIR", "XDG_BIN_HOME", "CARGO_HOME"] {
+        if let Some(v) = std::env::var_os(var) {
+            let d = PathBuf::from(v);
+            dirs.push(if var == "CARGO_HOME" { d.join("bin") } else { d });
+        }
+    }
+    for var in ["USERPROFILE", "HOME"] {
+        if let Some(home) = std::env::var_os(var) {
+            let home = PathBuf::from(home);
+            dirs.push(home.join(".local").join("bin"));
+            dirs.push(home.join(".cargo").join("bin"));
+        }
+    }
+    if let Some(local) = std::env::var_os("LOCALAPPDATA") {
+        dirs.push(PathBuf::from(local).join("Programs").join("uv"));
+    }
+    dirs.into_iter().find_map(|d| with_suffix(d.join(name)))
+}
+
 fn exe(dir: &Path, name: &str) -> PathBuf {
     dir.join(format!("{name}{}", std::env::consts::EXE_SUFFIX))
 }
 
 impl Launcher {
     fn python_command(&self, script_args: &[&str]) -> Command {
-        let py = &self.cfg.launcher.python;
-        let mut cmd = Command::new(&py[0]);
-        cmd.args(&py[1..])
+        let (program, rest) = trainer_program(&self.cfg.launcher.python, &self.cfg.launcher.venv)
+            .unwrap_or_else(|why| {
+                eprintln!("[truezero] cannot start the trainer: {why}");
+                std::process::exit(1)
+            });
+        let mut cmd = Command::new(program);
+        cmd.args(rest)
             .args(script_args)
             .current_dir(self.root.join("src").join("python"))
             .env("PYTHONUNBUFFERED", "1")
@@ -288,6 +383,12 @@ fn main() {
         }
     }
 
+    // Find the trainer's Python before starting anything, so a missing uv fails up front.
+    if let Err(why) = trainer_program(&launcher.cfg.launcher.python, &launcher.cfg.launcher.venv) {
+        eprintln!("[truezero] cannot start the trainer: {why}");
+        std::process::exit(1);
+    }
+
     // The server first: it creates the run the others join.
     let mut server = launcher.spawn(Role::Server, reset);
     let deadline = Instant::now() + Duration::from_secs(120);
@@ -367,5 +468,45 @@ fn main() {
             }
             children[i].1 = launcher.spawn(role, false);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn strs(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn without_uv_the_venv_python_runs_the_trainer() {
+        let dir = std::env::temp_dir().join(format!("tz_venv_{}", std::process::id()));
+        let py = if cfg!(windows) {
+            dir.join("Scripts").join("python.exe")
+        } else {
+            dir.join("bin").join("python")
+        };
+        fs::create_dir_all(py.parent().unwrap()).unwrap();
+        fs::write(&py, "").unwrap();
+        let python = strs(&["uv-that-does-not-exist", "run", "python"]);
+        // Not called "uv": no fallback, a clear error instead.
+        assert!(trainer_program(&python, dir.to_str().unwrap()).is_err());
+
+        let python = strs(&["/nonexistent/uv", "run", "python"]);
+        let (prog, args) = trainer_program(&python, dir.to_str().unwrap()).unwrap();
+        assert_eq!((prog, args), (py.clone(), Vec::<String>::new()));
+
+        let missing = dir.join("nope");
+        let err = trainer_program(&python, missing.to_str().unwrap()).unwrap_err();
+        assert!(err.contains("uv is not installed"), "{err}");
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn programs_are_found_by_absolute_path_and_on_path() {
+        let sh = find_program("sh").or_else(|| find_program("cmd"));
+        assert!(sh.map(|p| p.is_absolute()).unwrap_or(false));
+        assert_eq!(find_program("/definitely/not/here"), None);
     }
 }
