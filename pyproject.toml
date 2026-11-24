@@ -4,7 +4,7 @@ build-backend = "maturin"
 
 [project]
 name = "tzrust"
-requires-python = ">=3.10"
+requires-python = ">=3.10,<3.13"  # torch==2.4.1 (tch group) has no wheels for 3.13+
 version = "0.1.0"  # keep in sync with src/rust/Cargo.toml
 # Shared by every environment. torch is not listed here: it comes from exactly one of
 # the `torch` or `tch` groups below.
