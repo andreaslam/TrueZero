@@ -1,21 +1,25 @@
-"""Run identity for the trainer: the frozen run.toml, the run lock and the start log.
+"""Settings and runs for the trainer: the Python side of ``src/rust/runconfig.rs`` (same
+files, same rules; keep the two in step).
 
-Same files and the same rules as the Rust side (`src/rust/runconfig.rs`); keep the two in
-step. See `run.example.toml` for what a run is and how the lock works.
-
-- ``<data root>/run.toml``: the run's hyperparameters.
-- ``<data root>/hidden/run_lock.json``: created by the first process to start; pins the
-  run_id, the SHA-256 of run.toml's bytes and the git commit.
-- ``<data root>/hidden/run_log.jsonl``: one line per process start.
+- ``truezero.example.toml`` (repository root, committed): every setting and its default.
+- ``truezero.toml`` (repository root, not committed): the user's settings, laid over the
+  example. Only changed keys are needed; an unknown key or a wrongly typed value is an
+  error. Created from the example on first use.
+- ``<runs_dir>/current_run``: the current run's id, written only by the server.
+- ``<runs_dir>/<run id>/``: the run's folder (``nets/``, ``games/``, ``hidden/``, ...) with
+  ``run.json`` and ``config.toml``.
+- ``<run>/hidden/run_log.jsonl``: one line per process start; a start with a changed
+  truezero.toml keeps a copy in ``<run>/hidden/config_history/``. Nothing is refused.
 """
 
+import copy
 import hashlib
 import json
 import os
 import subprocess
 import sys
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 
 try:
@@ -23,71 +27,20 @@ try:
 except ModuleNotFoundError:  # Python 3.10
     tomllib = None
 
-from paths import data_path
+import paths
 
-REPO_ROOT = Path(__file__).resolve().parents[2]
-EXAMPLE_PATH = REPO_ROOT / "run.example.toml"
+REPO_ROOT = paths.REPO_ROOT
+EXAMPLE_FILE = "truezero.example.toml"
+CONFIG_FILE = "truezero.toml"
+CURRENT_RUN_FILE = "current_run"
+EXAMPLE_PATH = REPO_ROOT / EXAMPLE_FILE
 
-# Every key is required and nothing else is allowed, so a typo cannot fall back to a
-# default. Values are (type, check) with check returning an error message or None.
-_POS = (lambda v: None if v > 0 else "must be > 0")
-_NONNEG = (lambda v: None if v >= 0 else "must be >= 0")
-_PROB = (lambda v: None if 0 <= v <= 1 else "must be in [0, 1]")
-_ANY = (lambda v: None)
+# Same as runconfig.rs RESTART_EXIT_CODE: "start me again" to the launcher.
+RESTART_EXIT_CODE = 75
+# Same as runconfig.rs RESTART_SENTINEL: printed just before exiting for a restart.
+RESTART_SENTINEL = "exiting so the launcher restarts"
 
-SCHEMA = {
-    "run": {
-        "run_id": (str, lambda v: None if v.strip() else "must not be empty"),
-        "parent_run_id": (str, _ANY),
-        "fork_sample": (int, _NONNEG),
-        "seed": (int, _NONNEG),
-    },
-    "selfplay": {
-        "num_generators": (int, _POS),
-        "virtual_leaves": (int, _POS),
-        "max_nodes": (int, _POS),
-        "root_fpu": (float, _ANY),
-        "children_fpu": (float, _ANY),
-        "root_c_puct": (float, _ANY),
-        "children_c_puct": (float, _ANY),
-        "root_pst": (float, _ANY),
-        "children_pst": (float, _ANY),
-        "dirichlet_alpha": (float, _ANY),
-        "dirichlet_eps": (float, _PROB),
-        "moves_left_weight": (float, _ANY),
-        "moves_left_clip": (float, _ANY),
-        "moves_left_sharpness": (float, _ANY),
-        "pcr_full_prob": (float, _PROB),
-        "pcr_fast_visits": (int, _NONNEG),
-        "pcr_early_stop": (bool, _ANY),
-    },
-    "trainer": {
-        "buffer_size": (int, _POS),
-        "batch_size": (
-            int,
-            lambda v: None if v > 0 and v & (v - 1) == 0 else "must be a power of two",
-        ),
-        "min_buffer_to_train": (int, _POS),
-        "epochs_per_gen": (float, _POS),
-        "recent_batch_fraction": (float, _PROB),
-        "min_training_steps": (int, _POS),
-        "startup_training_steps": (int, _POS),
-        "test_fraction": (float, _PROB),
-        "lr_schedule": (str, _ANY),
-        "lr_warmup_samples": (str, _ANY),
-        "weight_decay": (float, _NONNEG),
-        "value_weight": (float, _NONNEG),
-        "wdl_weight": (float, _NONNEG),
-        "moves_left_weight": (float, _NONNEG),
-        "moves_left_delta": (float, _POS),
-        "policy_weight": (float, _NONNEG),
-        "clip_norm": (float, _POS),
-    },
-}
-
-# Environment variables that used to set run hyperparameters. They have no effect any more;
-# a start that finds one warns, so a value left in a PowerShell session is noticed but can
-# neither change a run nor block a start.
+# Environment variables that used to configure TrueZero; ignored with a warning.
 RETIRED_ENV_VARS = {
     "TZ_LR_SCHEDULE": "[trainer] lr_schedule",
     "TZ_LR_WARMUP_SAMPLES": "[trainer] lr_warmup_samples",
@@ -96,77 +49,173 @@ RETIRED_ENV_VARS = {
     "TZ_PCR_FULL_PROB": "[selfplay] pcr_full_prob",
     "TZ_PCR_FAST_VISITS": "[selfplay] pcr_fast_visits",
     "TZ_PCR_EARLY_STOP": "[selfplay] pcr_early_stop",
+    "TZ_NUM_EXECUTORS": "[selfplay] num_executors",
+    "TZ_BATCH_TIMEOUT_US": "[selfplay] batch_timeout_us",
+    "TZ_SERVER_PORT": "[server] port",
 }
 
 
-class RunRefused(Exception):
-    """The run must not start; the message says why and how to override."""
+class ConfigError(Exception):
+    """truezero.toml cannot be used; the message says why."""
 
 
-def _type_ok(value, kind):
-    if kind is float:
-        # TOML writes 1 and 1.0 differently; both are fine for a float setting.
-        return isinstance(value, (int, float)) and not isinstance(value, bool)
-    if kind is int:
-        return isinstance(value, int) and not isinstance(value, bool)
-    return isinstance(value, kind)
+def _kind(value):
+    for kind, name in (
+        (bool, "true or false"),
+        (int, "an integer"),
+        (float, "a number"),
+        (str, "a string"),
+        (list, "a list"),
+        (dict, "a table"),
+    ):
+        if isinstance(value, kind):
+            return kind, name
+    return type(value), type(value).__name__
+
+
+def merge(example, user):
+    """The example's tables with the user's values laid over them. Raises ValueError naming
+    every unknown key or wrongly typed value (an integer is accepted for a number)."""
+    merged = copy.deepcopy(example)
+    problems = []
+    for table, values in user.items():
+        base = merged.get(table)
+        if not isinstance(base, dict) or not isinstance(values, dict):
+            problems.append(f"unknown table [{table}]")
+            continue
+        for key, value in values.items():
+            if key not in base:
+                problems.append(f"unknown key [{table}] {key}")
+                continue
+            want, want_name = _kind(base[key])
+            got, got_name = _kind(value)
+            if want is float and got is int:
+                value = float(value)
+            elif want is not got:
+                problems.append(f"[{table}] {key} must be {want_name}, got {got_name}")
+                continue
+            base[key] = value
+    if problems:
+        raise ValueError("; ".join(problems))
+    return merged
+
+
+def _range(problems, table, key, value, ok, msg):
+    if not ok(value):
+        problems.append(f"[{table}] {key} {msg}")
 
 
 def validate(cfg):
-    """Raise ValueError naming every problem in a parsed run.toml."""
-    problems = []
-    for name in cfg.keys() - SCHEMA.keys():
-        problems.append(f"unknown table [{name}]")
-    for table, keys in SCHEMA.items():
-        section = cfg.get(table)
-        if not isinstance(section, dict):
-            problems.append(f"missing table [{table}]")
-            continue
-        for key in section.keys() - keys.keys():
-            problems.append(f"unknown key [{table}] {key}")
-        for key, (kind, check) in keys.items():
-            if key not in section:
-                problems.append(f"missing key [{table}] {key}")
-            elif not _type_ok(section[key], kind):
-                problems.append(f"[{table}] {key} must be a {kind.__name__}")
-            elif (msg := check(section[key])) is not None:
-                problems.append(f"[{table}] {key} {msg}")
-    run = cfg.get("run", {})
-    if isinstance(run, dict) and ("parent_run_id" in run and "fork_sample" in run):
-        if (run["parent_run_id"] == "") != (run["fork_sample"] == 0):
-            problems.append("[run] parent_run_id and fork_sample must be set together")
-    if problems:
-        raise ValueError("; ".join(problems))
+    """Raise ValueError naming every out-of-range value in the effective settings (types
+    were checked by `merge`). Same checks as Config::validate in Rust, plus [trainer]."""
+    p = []
+    name = cfg["run"]["name"]
+    if not name.strip() or any(c in name for c in "/\\:"):
+        p.append("[run] name must be non-empty and contain no / \\ or :")
+    if cfg["net"]["arch"] not in ("TrueNet", "TrueNetXS"):
+        p.append('[net] arch must be "TrueNet" or "TrueNetXS"')
+    for key in ("blocks", "channels"):
+        _range(p, "net", key, cfg["net"][key], lambda v: v > 0, "must be > 0")
+    s = cfg["selfplay"]
+    for key in ("num_generators", "virtual_leaves", "num_executors", "batch_size", "max_nodes"):
+        _range(p, "selfplay", key, s[key], lambda v: v > 0, "must be > 0")
+    _range(p, "selfplay", "pcr_full_prob", s["pcr_full_prob"], lambda v: 0 <= v <= 1,
+           "must be in [0, 1]")
+    if s["pcr_full_prob"] < 1 and s["pcr_fast_visits"] < 2:
+        p.append("[selfplay] pcr_fast_visits must be at least 2")
+    t = cfg["trainer"]
+    for key in ("buffer_size", "min_buffer_to_train", "min_training_steps",
+                "startup_training_steps", "epochs_per_gen", "moves_left_delta", "clip_norm"):
+        _range(p, "trainer", key, t[key], lambda v: v > 0, "must be > 0")
+    bs = t["batch_size"]
+    if not (bs > 0 and bs & (bs - 1) == 0):
+        p.append("[trainer] batch_size must be a power of two")
+    for key in ("recent_batch_fraction", "test_fraction"):
+        _range(p, "trainer", key, t[key], lambda v: 0 <= v <= 1, "must be in [0, 1]")
+    for key in ("weight_decay", "value_weight", "wdl_weight", "moves_left_weight", "policy_weight"):
+        _range(p, "trainer", key, t[key], lambda v: v >= 0, "must be >= 0")
+    if cfg["wandb"]["mode"] not in ("online", "offline", "off"):
+        p.append('[wandb] mode must be "online", "offline" or "off"')
+    if not cfg["launcher"]["python"]:
+        p.append("[launcher] python must name a program")
+    if p:
+        raise ValueError("; ".join(p))
 
 
-def load_run_config(path):
-    """Parse and validate run.toml. Returns (config dict, SHA-256 of the file's bytes)."""
+def config_from_texts(example_text, user_text):
+    """The checked effective settings from the two files' texts."""
     if tomllib is None:
-        raise RunRefused("reading run.toml needs Python 3.11+ (tomllib)")
+        raise ConfigError("reading truezero.toml needs Python 3.11+ (tomllib)")
     try:
-        raw = Path(path).read_bytes()
-    except OSError as e:
-        raise RunRefused(
-            f"cannot read {path}: {e}. Copy {EXAMPLE_PATH.name} from the repository root "
-            "there and edit it before the first start."
-        ) from e
-    try:
-        cfg = tomllib.loads(raw.decode("utf-8"))
+        cfg = merge(tomllib.loads(example_text), tomllib.loads(user_text))
         validate(cfg)
-    except (ValueError, UnicodeDecodeError) as e:
-        raise RunRefused(f"{path}: {e}") from e
-    return cfg, hashlib.sha256(raw).hexdigest()
+    except (ValueError, tomllib.TOMLDecodeError) as e:
+        raise ConfigError(f"{CONFIG_FILE}: {e}") from e
+    return cfg
+
+
+def ensure_user_config(root=REPO_ROOT):
+    """Create truezero.toml from the example if it does not exist yet."""
+    path = Path(root) / CONFIG_FILE
+    if path.exists():
+        return
+    try:
+        with open(path, "xb") as f:
+            f.write((Path(root) / EXAMPLE_FILE).read_bytes())
+        print(f"[config] Created {path} from {EXAMPLE_FILE}; edit it to change any setting.")
+    except FileExistsError:
+        pass
+
+
+@dataclass
+class LoadedConfig:
+    config: dict
+    user_bytes: bytes
+    config_sha256: str
+
+
+def load_config(root=REPO_ROOT):
+    """Load truezero.toml (creating it if needed) over the example in `root`."""
+    root = Path(root)
+    try:
+        ensure_user_config(root)
+        example = (root / EXAMPLE_FILE).read_text(encoding="utf-8")
+        user_bytes = (root / CONFIG_FILE).read_bytes()
+    except OSError as e:
+        raise ConfigError(str(e)) from e
+    cfg = config_from_texts(example, user_bytes.decode("utf-8"))
+    return LoadedConfig(cfg, user_bytes, hashlib.sha256(user_bytes).hexdigest())
+
+
+def runs_dir(cfg, root=REPO_ROOT):
+    return Path(root) / cfg["paths"]["runs_dir"]
+
+
+def repo_path(rel, root=REPO_ROOT):
+    """A path from the config that is relative to the repository root."""
+    return str(Path(root) / rel)
+
+
+def current_run_id(runs):
+    try:
+        text = (Path(runs) / CURRENT_RUN_FILE).read_text().strip()
+    except OSError:
+        return None
+    return text or None
 
 
 def retired_env_var_warning(environ=os.environ):
     """A warning naming every retired variable that is set, or None. They are ignored."""
-    found = [f"{n} (now run.toml {k})" for n, k in RETIRED_ENV_VARS.items() if n in environ]
+    found = [
+        f"{n} (now truezero.toml {k})" for n, k in RETIRED_ENV_VARS.items() if n in environ
+    ]
     if not found:
         return None
     return (
-        "IGNORING environment variables that no longer configure a run: "
+        "IGNORING environment variables that no longer configure TrueZero: "
         + ", ".join(found)
-        + ". run.toml decides; remove them (PowerShell: Remove-Item Env:NAME) to silence this."
+        + ". truezero.toml decides; remove them (PowerShell: Remove-Item Env:NAME) to "
+        "silence this."
     )
 
 
@@ -191,7 +240,6 @@ def git_state(repo=REPO_ROOT):
         dirty = git("status", "--porcelain", "--untracked-files=no") != ""
         return sha, dirty
     except (OSError, subprocess.SubprocessError):
-        # No repository (the Docker image): the commit the image was built from.
         injected = os.environ.get("TZ_BUILD_GIT_SHA", "")
         if injected and injected != "unknown":
             return injected, False
@@ -200,12 +248,12 @@ def git_state(repo=REPO_ROOT):
 
 @dataclass
 class StartIdentity:
-    run: dict
+    run_id: str
+    run_name: str
     config_sha256: str
     git_sha: str
     git_dirty: bool
     process: str
-    overrides_used: list = field(default_factory=list)
 
 
 def _append_jsonl(path, entry):
@@ -217,140 +265,89 @@ def _append_jsonl(path, entry):
         print(f"[run][Warning] could not append to {path}: {e!r}")
 
 
-def _log_start(hidden_dir, ident, used):
+def record_start(run_dir, ident, user_bytes):
+    """Log this start in hidden/run_log.jsonl; keep a copy of truezero.toml if it changed
+    since the run was created. Returns the warnings. Never refuses (same as Rust)."""
+    run_dir = Path(run_dir)
+    hidden = run_dir / "hidden"
+    notes = []
+    if ident.git_dirty:
+        notes.append("tracked files have uncommitted changes (logged as git_dirty)")
+    try:
+        record = json.loads((run_dir / "run.json").read_text())
+    except (OSError, ValueError):
+        record = None
+    if record is not None:
+        if record.get("git_sha") != ident.git_sha:
+            notes.append(
+                f"the run was created at commit {record.get('git_sha')} and this program is "
+                f"at {ident.git_sha} (logged)"
+            )
+        if record.get("config_sha256") != ident.config_sha256:
+            copy_path = hidden / "config_history" / f"{ident.config_sha256[:12]}.toml"
+            if not copy_path.exists():
+                try:
+                    copy_path.parent.mkdir(parents=True, exist_ok=True)
+                    copy_path.write_bytes(user_bytes)
+                except OSError as e:
+                    print(f"[run][Warning] could not save {copy_path}: {e!r}")
+            notes.append(
+                f"truezero.toml changed since the run started (copy kept in {copy_path})"
+            )
     _append_jsonl(
-        os.path.join(hidden_dir, "run_log.jsonl"),
+        str(hidden / "run_log.jsonl"),
         {
             "time": time.time(),
             "process": ident.process,
             "pid": os.getpid(),
-            "run_id": ident.run["run_id"],
+            "run_id": ident.run_id,
             "git_sha": ident.git_sha,
             "git_dirty": ident.git_dirty,
             "config_sha256": ident.config_sha256,
-            "overrides_used": used,
         },
     )
+    return notes
 
 
-def check_run_lock(hidden_dir, ident, allow_config_change=False, allow_code_change=False):
-    """Check `ident` against the run lock, creating it on the first start, and log the
-    start. Returns the warnings and overrides used; raises RunRefused otherwise.
-
-    - a different run_id in the same data root is always refused;
-    - a different commit or an unknown commit needs allow_code_change;
-    - uncommitted changes to tracked files only warn (and are logged as git_dirty);
-    - a different run.toml needs allow_config_change.
-    """
-    os.makedirs(hidden_dir, exist_ok=True)
-    lock_path = os.path.join(hidden_dir, "run_lock.json")
-    dirty_warning = (
-        ["warning: tracked files have uncommitted changes (logged as git_dirty)"]
-        if ident.git_dirty
-        else []
-    )
-    used = list(dirty_warning)
-    code_problems = []
-    if ident.git_sha == "unknown":
-        code_problems.append("the git commit is unknown")
-
-    if not os.path.exists(lock_path):
-        if code_problems:
-            if not allow_code_change:
-                raise RunRefused(
-                    f"refusing to start run {ident.run['run_id']}: "
-                    + "; ".join(code_problems)
-                    + ". Run from a git checkout (or set TZ_BUILD_GIT_SHA), or pass "
-                    "--allow-code-change."
-                )
-            used.append("allow-code-change: " + "; ".join(code_problems))
-        run = ident.run
-        lock = {
-            "run_id": run["run_id"],
-            "parent_run_id": run["parent_run_id"],
-            "fork_sample": run["fork_sample"],
-            "seed": run["seed"],
-            "git_sha": ident.git_sha,
-            "config_sha256": ident.config_sha256,
-            "created_at": time.time(),
-            "created_by": ident.process,
-        }
-        try:
-            with open(lock_path, "x") as f:
-                json.dump(lock, f, indent=2)
-                f.flush()
-                os.fsync(f.fileno())
-            print(
-                f"[run] Created run lock {lock_path} for run {run['run_id']} "
-                f"at commit {ident.git_sha}"
-            )
-            _log_start(hidden_dir, ident, used)
-            return used
-        except FileExistsError:
-            used = list(dirty_warning)  # someone else created it first: check theirs
-
-    with open(lock_path) as f:
-        lock = json.load(f)
-
-    if lock["run_id"] != ident.run["run_id"]:
-        raise RunRefused(
-            f"run.toml says run_id {ident.run['run_id']!r} but this data root belongs to "
-            f"run {lock['run_id']!r} ({lock_path}). A new run or a branch needs its own "
-            "data root."
-        )
-    if lock["git_sha"] != ident.git_sha:
-        code_problems.insert(
-            0, f"at commit {ident.git_sha} but the run is pinned to {lock['git_sha']}"
-        )
-    if code_problems:
-        if not allow_code_change:
-            raise RunRefused(
-                f"refusing to start run {ident.run['run_id']}: "
-                + "; ".join(code_problems)
-                + ". Check out the pinned commit, or pass --allow-code-change."
-            )
-        used.append("allow-code-change: " + "; ".join(code_problems))
-    if lock["config_sha256"] != ident.config_sha256:
-        problem = (
-            f"run.toml (sha256 {ident.config_sha256[:12]}) differs from the locked one "
-            f"(sha256 {lock['config_sha256'][:12]})"
-        )
-        if not allow_config_change:
-            raise RunRefused(
-                f"refusing to start run {ident.run['run_id']}: {problem}. Restore it, start "
-                "a new run in its own data root, or pass --allow-config-change."
-            )
-        used.append("allow-config-change: " + problem)
-    _log_start(hidden_dir, ident, used)
-    return used
-
-
-def start_run(process, allow_config_change=False, allow_code_change=False, path=None):
-    """Load run.toml, refuse retired env vars, check the run lock and print the effective
-    config. Returns (config, StartIdentity). Exits with a message on refusal."""
+def start(process):
+    """Start-up for the trainer: load the settings, wait for the server to have created a
+    run, fix this process's data root to it and record the start. Returns
+    (effective settings, StartIdentity, run folder). Exits with a message on a bad
+    truezero.toml."""
+    if (warning := retired_env_var_warning()) is not None:
+        print(f"[run][Warning] {warning}", file=sys.stderr)
     try:
-        if (warning := retired_env_var_warning()) is not None:
-            print(f"[run][Warning] {warning}", file=sys.stderr)
-        path = path or data_path("run.toml")
-        cfg, sha = load_run_config(path)
-        git_sha, dirty = git_state()
-        ident = StartIdentity(cfg["run"], sha, git_sha, dirty, process)
-        ident.overrides_used = check_run_lock(
-            data_path("hidden"), ident, allow_config_change, allow_code_change
-        )
-    except RunRefused as e:
-        print(f"[run] {e}", file=sys.stderr)
+        loaded = load_config()
+    except ConfigError as e:
+        print(f"[config] {e}", file=sys.stderr)
         sys.exit(2)
-    run = cfg["run"]
-    print(
-        f"[run] run {run['run_id']} (parent {run['parent_run_id']!r}, fork_sample "
-        f"{run['fork_sample']}), config {path} sha256 {sha}, commit {git_sha}"
-        + (" (dirty)" if dirty else "")
+    cfg = loaded.config
+    pinned = os.environ.get("TZ_DATA_ROOT")
+    if pinned:
+        run_dir = Path(pinned)
+    else:
+        runs = runs_dir(cfg)
+        waited = False
+        while (run_id := current_run_id(runs)) is None:
+            if not waited:
+                print(f"[run] No run yet in {runs}; waiting for the server to create one.")
+                waited = True
+            time.sleep(1)
+        run_dir = runs / run_id
+    paths.set_root(run_dir)
+    git_sha, dirty = git_state()
+    ident = StartIdentity(
+        run_dir.name, cfg["run"]["name"], loaded.config_sha256, git_sha, dirty, process
     )
-    for o in ident.overrides_used:
-        print(f"[run][Warning] {o}")
+    notes = record_start(run_dir, ident, loaded.user_bytes)
+    print(
+        f"[run] run {ident.run_id} in {run_dir}, settings sha256 {ident.config_sha256[:12]}, "
+        f"commit {git_sha}" + (" (dirty)" if dirty else "")
+    )
+    for n in notes:
+        print(f"[run][Warning] {n}")
     print(f"[run] effective [trainer]: {cfg['trainer']}")
-    return cfg, ident
+    return cfg, ident, run_dir
 
 
 # ---------------------------------------------------------------------------
@@ -366,7 +363,7 @@ def start_run(process, allow_config_change=False, allow_code_change=False, path=
 
 def find_datagen_record(bin_sha256, path=None):
     """The self-play line for a file, or None (e.g. self-play runs on another machine)."""
-    path = path or data_path("hidden/provenance/datagen.jsonl")
+    path = path or paths.data_path("hidden/provenance/datagen.jsonl")
     try:
         with open(path) as f:
             for line in f:
@@ -386,13 +383,13 @@ def record_received_file(saved_path, bin_bytes, ident, samples_trained=None, hid
     """Log a received replay file and check it came from this run. Returns the matching
     self-play record (or None). A file from another run or config is reported, not dropped:
     deciding to discard data is the user's call."""
-    hidden_dir = hidden_dir or data_path("hidden")
+    hidden_dir = hidden_dir or paths.data_path("hidden")
     sha = hashlib.sha256(bin_bytes).hexdigest()
     rec = find_datagen_record(sha, os.path.join(hidden_dir, "provenance", "datagen.jsonl"))
     mismatch = []
     if rec is not None and ident is not None:
         for key, ours in (
-            ("run_id", ident.run["run_id"]),
+            ("run_id", ident.run_id),
             ("config_sha256", ident.config_sha256),
             ("git_sha", ident.git_sha),
         ):

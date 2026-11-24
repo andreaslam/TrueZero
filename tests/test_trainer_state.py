@@ -19,7 +19,7 @@ from lib.logger import Logger
 import client
 import network
 
-# Short enough that the tests cross the warm-up and a drop (run.toml [trainer] values).
+# Short enough that the tests cross the warm-up and a drop (truezero.toml [trainer] values).
 SCHEDULE = {
     "LR_SCHEDULE": "0:1e-3,20K:5e-4",
     "LR_WARMUP_SAMPLES": "8K",

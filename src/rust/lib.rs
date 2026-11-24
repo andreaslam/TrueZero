@@ -1,14 +1,13 @@
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 pub fn workspace_root() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join("..").join("..")
+    runconfig::repo_root()
 }
 
+/// `rel` inside this process's data root: the current run's folder (see
+/// `runconfig::data_root`).
 pub fn data_path(rel: &str) -> PathBuf {
-    std::env::var_os("TZ_DATA_ROOT")
-        .map(PathBuf::from)
-        .unwrap_or_else(workspace_root)
-        .join(rel)
+    runconfig::data_root().join(rel)
 }
 pub fn data_path_str(rel: &str) -> String {
     data_path(rel).to_string_lossy().into_owned()

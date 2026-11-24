@@ -3,6 +3,8 @@
 /nets/
 /frames/
 /runs/
+/books/
+/truezero.toml
 /experiment_nets/
 /python_client_games/
 /UHO_2024/

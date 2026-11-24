@@ -10,7 +10,7 @@
 //!
 //! The result is one line on stdout starting with `LADDER_RESULT ` followed by JSON, for
 //! the trainer (`src/python/ladder.py`) to log. Search settings are fixed here (pinned by the
-//! commit), not taken from run.toml, so every rung of the ladder is measured the same way.
+//! commit), not taken from truezero.toml, so every rung of the ladder is measured the same way.
 
 use cozy_chess::{Board, Color, GameStatus, Move, Piece, Square};
 use flume::Sender;

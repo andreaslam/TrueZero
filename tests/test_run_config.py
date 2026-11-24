@@ -1,35 +1,40 @@
-"""run.toml and the run lock: the trainer side of src/rust/runconfig.rs (same rules).
+"""truezero.toml, runs and provenance: the trainer side of src/rust/runconfig.rs (same
+rules; the overlay cases are shared through tests/fixtures/config_overlay_cases.json).
 
 Run from `src/python`:
 
     PYTHONPATH=. uv run python -m unittest discover -s ../../tests
 """
 
+import hashlib
 import json
 import os
 import shutil
 import tempfile
 import unittest
+from pathlib import Path
 from unittest import mock
 
+import books
 import client
+import paths
 import runconfig
 
-EXAMPLE = runconfig.EXAMPLE_PATH
+EXAMPLE_TEXT = runconfig.EXAMPLE_PATH.read_text()
+CASES = Path(__file__).parent / "fixtures" / "config_overlay_cases.json"
 
 
-def identity(sha="abc", config="a", dirty=False, run_id=None):
-    cfg, _ = runconfig.load_run_config(EXAMPLE)
-    run = dict(cfg["run"])
-    if run_id is not None:
-        run["run_id"] = run_id
-    return runconfig.StartIdentity(run, config * 64, sha, dirty, "test")
+def defaults():
+    return runconfig.config_from_texts(EXAMPLE_TEXT, "")
 
 
-class RunConfigTests(unittest.TestCase):
+def identity(sha="abc", config="a", dirty=False, run_id="truenet-128x10-20261124-1503"):
+    return runconfig.StartIdentity(run_id, "truenet-128x10", config * 64, sha, dirty, "test")
+
+
+class ConfigTests(unittest.TestCase):
     def test_example_reproduces_the_previous_trainer_defaults(self):
-        """Adopting run.example.toml must not change the running trainer."""
-        cfg, _ = runconfig.load_run_config(EXAMPLE)
+        """The example's [trainer] equals the trainer's built-in defaults."""
         names = [
             "BUFFER_SIZE",
             "BATCH_SIZE",
@@ -47,119 +52,189 @@ class RunConfigTests(unittest.TestCase):
         before = {n: getattr(client, n) for n in names}
         weights_before = dict(client.LOSS_WEIGHTS)
         with mock.patch.multiple(client, **before), mock.patch.dict(client.LOSS_WEIGHTS):
-            client.apply_run_config(cfg)
+            client.apply_run_config(defaults())
             self.assertEqual({n: getattr(client, n) for n in names}, before)
             self.assertEqual(client.LOSS_WEIGHTS, weights_before)
 
-    def test_missing_unknown_and_mistyped_keys_are_errors(self):
-        text = EXAMPLE.read_text()
-        cases = {
-            "missing": text.replace("batch_size = 2048\n", ""),
-            "unknown": text.replace("batch_size = 2048", "batch_sise = 2048"),
-            "type": text.replace("batch_size = 2048", 'batch_size = "2048"'),
-            "not a power of two": text.replace("batch_size = 2048", "batch_size = 2000"),
-            "table": text + "\n[extra]\nx = 1\n",
-            "fork without parent": text.replace("fork_sample = 0", "fork_sample = 5"),
-        }
-        for name, bad in cases.items():
-            with self.subTest(name), self.assertRaises(ValueError):
-                runconfig.validate(runconfig.tomllib.loads(bad))
+    def test_overlay_cases_shared_with_rust(self):
+        cases = json.loads(CASES.read_text())["cases"]
+        for case in cases:
+            with self.subTest(case["name"]):
+                if not case["ok"]:
+                    with self.assertRaises(runconfig.ConfigError):
+                        runconfig.config_from_texts(EXAMPLE_TEXT, case["user"])
+                    continue
+                cfg = runconfig.config_from_texts(EXAMPLE_TEXT, case["user"])
+                for table, key, value in case.get("expect", []):
+                    self.assertEqual(cfg[table][key], value)
 
-    def test_hash_is_of_the_file_bytes(self):
-        """The Rust side hashes the same bytes, so the two agree without a shared parser."""
-        import hashlib
+    def test_trainer_ranges(self):
+        for bad in (
+            "[trainer]\nbatch_size = 2000\n",
+            "[trainer]\ntest_fraction = 1.5\n",
+            '[wandb]\nmode = "sometimes"\n',
+        ):
+            with self.subTest(bad), self.assertRaises(runconfig.ConfigError):
+                runconfig.config_from_texts(EXAMPLE_TEXT, bad)
 
-        _, sha = runconfig.load_run_config(EXAMPLE)
-        self.assertEqual(sha, hashlib.sha256(EXAMPLE.read_bytes()).hexdigest())
+    def test_first_use_creates_truezero_toml(self):
+        d = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, d)
+        (d / runconfig.EXAMPLE_FILE).write_text(EXAMPLE_TEXT)
+        loaded = runconfig.load_config(d)
+        self.assertEqual((d / runconfig.CONFIG_FILE).read_text(), EXAMPLE_TEXT)
+        self.assertEqual(loaded.config_sha256, hashlib.sha256(EXAMPLE_TEXT.encode()).hexdigest())
+        # The user's edits are kept on later loads.
+        (d / runconfig.CONFIG_FILE).write_text("[selfplay]\nvirtual_leaves = 2\n")
+        self.assertEqual(runconfig.load_config(d).config["selfplay"]["virtual_leaves"], 2)
 
     def test_retired_env_vars_warn_and_are_ignored(self):
-        w = runconfig.retired_env_var_warning({"TZ_LR_SCHEDULE": "0:1e-3"})
+        w = runconfig.retired_env_var_warning({"TZ_LR_SCHEDULE": "0:1e-3", "TZ_SERVER_PORT": "1"})
         self.assertIn("TZ_LR_SCHEDULE", w)
-        self.assertIn("lr_schedule", w)
-        self.assertIsNone(
-            runconfig.retired_env_var_warning({"TZ_SERVER_PORT": "1", "TZ_NUM_EXECUTORS": "2"})
-        )
-        # The trainer's settings come from run.toml whatever the environment says.
-        cfg, _ = runconfig.load_run_config(EXAMPLE)
+        self.assertIn("[server] port", w)
+        self.assertIsNone(runconfig.retired_env_var_warning({"TZ_DEVICE": "cuda"}))
+        cfg = defaults()
         with mock.patch.dict(os.environ, {"TZ_LR_SCHEDULE": "0:9"}), mock.patch.multiple(
             client, LR_SCHEDULE=client.LR_SCHEDULE, LR_WARMUP_SAMPLES=client.LR_WARMUP_SAMPLES
         ), mock.patch.dict(client.LOSS_WEIGHTS):
             client.apply_run_config(cfg)
             self.assertEqual(client.LR_SCHEDULE, cfg["trainer"]["lr_schedule"])
 
+    def test_new_net_follows_net_config(self):
+        import network
 
-class RunLockTests(unittest.TestCase):
+        self.assertIsInstance(client.new_net(defaults()["net"]), network.TrueNet)
+        small = client.new_net({"arch": "TrueNetXS", "blocks": 1, "channels": 8})
+        self.assertIsInstance(small, network.TrueNetXS)
+        self.assertEqual(len(small.backBone), 1)
+
+
+class RunTests(unittest.TestCase):
     def setUp(self):
-        self.dir = tempfile.mkdtemp()
+        self.dir = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.dir)
 
-    def tearDown(self):
-        shutil.rmtree(self.dir)
-
-    def lock(self):
-        with open(os.path.join(self.dir, "run_lock.json")) as f:
-            return json.load(f)
-
-    def test_first_start_creates_the_lock_and_identical_restart_passes(self):
-        self.assertEqual(runconfig.check_run_lock(self.dir, identity()), [])
-        self.assertEqual(self.lock()["git_sha"], "abc")
-        self.assertEqual(self.lock()["seed"], 0)
-        self.assertEqual(runconfig.check_run_lock(self.dir, identity()), [])
-        with open(os.path.join(self.dir, "run_log.jsonl")) as f:
-            self.assertEqual(len(f.readlines()), 2)
-
-    def test_dirty_tree_only_warns(self):
-        used = runconfig.check_run_lock(self.dir, identity(dirty=True))
-        self.assertEqual(len(used), 1)
-        self.assertTrue(used[0].startswith("warning:"))
-        self.assertTrue(os.path.exists(os.path.join(self.dir, "run_lock.json")))
-        # Still pinned: another commit is refused even with a dirty tree.
-        with self.assertRaises(runconfig.RunRefused):
-            runconfig.check_run_lock(self.dir, identity(sha="def", dirty=True))
-        with self.assertRaises(runconfig.RunRefused):
-            runconfig.check_run_lock(tempfile.mkdtemp(dir=self.dir), identity(sha="unknown"))
-
-    def test_other_commit_or_config_is_refused_unless_overridden(self):
-        runconfig.check_run_lock(self.dir, identity())
-        with self.assertRaises(runconfig.RunRefused):
-            runconfig.check_run_lock(self.dir, identity(sha="def"))
-        self.assertEqual(
-            len(runconfig.check_run_lock(self.dir, identity(sha="def"), allow_code_change=True)),
-            1,
-        )
-        with self.assertRaises(runconfig.RunRefused):
-            runconfig.check_run_lock(self.dir, identity(config="b"), allow_code_change=True)
-        used = runconfig.check_run_lock(
-            self.dir, identity(config="b"), allow_config_change=True
-        )
-        self.assertEqual(len(used), 1)
-
-    def test_another_run_id_is_always_refused(self):
-        runconfig.check_run_lock(self.dir, identity())
-        with self.assertRaises(runconfig.RunRefused):
-            runconfig.check_run_lock(
-                self.dir,
-                identity(run_id="other"),
-                allow_config_change=True,
-                allow_code_change=True,
-            )
-
-    def test_lock_written_by_rust_is_read(self):
-        """Field names match RunLock in runconfig.rs."""
-        with open(os.path.join(self.dir, "run_lock.json"), "w") as f:
-            json.dump(
+    def rust_run(self, config_sha256="a" * 64, git_sha="abc"):
+        """A run folder as runconfig.rs create_run writes it."""
+        run = self.dir / "truenet-128x10-20261124-1503"
+        (run / "hidden").mkdir(parents=True)
+        (run / "run.json").write_text(
+            json.dumps(
                 {
-                    "run_id": identity().run["run_id"],
-                    "parent_run_id": "",
-                    "fork_sample": 0,
-                    "seed": 0,
-                    "git_sha": "abc",
-                    "config_sha256": "a" * 64,
+                    "run_id": run.name,
+                    "name": "truenet-128x10",
                     "created_at": 1.0,
-                    "created_by": "datagen",
-                },
-                f,
+                    "git_sha": git_sha,
+                    "git_dirty": False,
+                    "config_sha256": config_sha256,
+                }
             )
-        self.assertEqual(runconfig.check_run_lock(self.dir, identity()), [])
+        )
+        (self.dir / runconfig.CURRENT_RUN_FILE).write_text(run.name + "\n")
+        return run
+
+    def test_current_run(self):
+        self.assertIsNone(runconfig.current_run_id(self.dir))
+        run = self.rust_run()
+        self.assertEqual(runconfig.current_run_id(self.dir), run.name)
+
+    def test_unchanged_start_is_logged_quietly(self):
+        run = self.rust_run()
+        self.assertEqual(runconfig.record_start(run, identity(), b"x"), [])
+        lines = (run / "hidden" / "run_log.jsonl").read_text().splitlines()
+        self.assertEqual(json.loads(lines[0])["run_id"], identity().run_id)
+
+    def test_changed_config_or_commit_is_logged_not_refused(self):
+        run = self.rust_run()
+        notes = runconfig.record_start(run, identity(sha="def", config="b"), b"[run]\nseed = 1\n")
+        self.assertEqual(len(notes), 2)
+        copy = run / "hidden" / "config_history" / ("b" * 12 + ".toml")
+        self.assertEqual(copy.read_bytes(), b"[run]\nseed = 1\n")
+
+    def test_start_waits_for_the_server_then_fixes_the_data_root(self):
+        run = self.rust_run()
+        cfg = defaults()
+        cfg["paths"]["runs_dir"] = str(self.dir)
+        loaded = runconfig.LoadedConfig(cfg, b"", "c" * 64)
+        old_root = paths._root
+        self.addCleanup(paths.set_root, old_root)
+        env = {k: v for k, v in os.environ.items() if k != "TZ_DATA_ROOT"}
+        with mock.patch.dict(os.environ, env, clear=True), mock.patch.object(
+            runconfig, "load_config", return_value=loaded
+        ):
+            got_cfg, ident, run_dir = runconfig.start("test")
+        self.assertEqual(run_dir, run)
+        self.assertEqual(ident.run_id, run.name)
+        self.assertEqual(paths.data_path("nets"), str(run / "nets"))
+
+    def test_run_change_messages_from_the_server(self):
+        """Wire forms as runconfig.rs run_messages_on_the_wire pins them."""
+        me = "r-20261124-1503"
+        same = json.loads('{"purpose":{"RunInfo":"r-20261124-1503"}}')
+        other = json.loads('{"purpose":{"RunInfo":"r-20261124-1600"}}')
+        reset = json.loads('{"purpose":{"ResetRun":"r2"}}')
+        self.assertIsNone(client.run_change(same, me))
+        self.assertIn("r-20261124-1600", client.run_change(other, me))
+        self.assertIn("r2", client.run_change(reset, me))
+        self.assertIsNone(client.run_change({"purpose": {"RequestingNet": []}}, me))
+        self.assertIsNone(client.run_change({"purpose": "x"}, me))
+
+
+class BookTests(unittest.TestCase):
+    PGN = (
+        '[Event "?"]\n\n1. e4 e5 2. Nf3 Nc6 *\n\n'
+        '[Event "?"]\n\n1. d4 d5 *\n'
+    )
+
+    def setUp(self):
+        self.dir = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.dir)
+
+    @staticmethod
+    def zipped(name, text):
+        import io
+        import zipfile
+
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, "w") as z:
+            z.writestr(name, text)
+        return buf.getvalue()
+
+    def test_epd_archive(self):
+        dest = self.dir / "books" / "x.epd"
+        fen = "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1"
+        how = books.ensure_book(dest, fetch=lambda url: self.zipped("x.epd", fen + "\n"))
+        self.assertIn("downloaded", how)
+        self.assertEqual(dest.read_text().strip(), fen)
+
+    def test_pgn_only_book_is_converted_to_fens(self):
+        """official-stockfish/books publishes 8moves_v3 only as a PGN."""
+        import urllib.error
+
+        seen = []
+
+        def fetch(url):
+            seen.append(url)
+            if url.endswith(".epd.zip"):
+                raise urllib.error.HTTPError(url, 404, "Not Found", None, None)
+            return self.zipped("x.pgn", self.PGN)
+
+        dest = self.dir / "x.epd"
+        with mock.patch.object(books, "REPO_ROOT", self.dir):
+            how = books.ensure_book(dest, fetch=fetch)
+        self.assertIn("converted 2 games", how)
+        self.assertTrue(seen[1].endswith("/x.pgn.zip"))
+        lines = dest.read_text().splitlines()
+        self.assertEqual(
+            lines[0], "r1bqkbnr/pppp1ppp/2n5/4p3/4P3/5N2/PPPP1PPP/RNBQKB1R w KQkq - 2 3"
+        )
+        self.assertEqual(len(lines[1].split()), 6)  # full FEN, as Board::from_fen needs
+
+    def test_existing_book_is_left_alone(self):
+        dest = self.dir / "x.epd"
+        dest.write_text("mine\n")
+        self.assertEqual(books.ensure_book(dest, fetch=None), "present")
+        self.assertEqual(dest.read_text(), "mine\n")
 
 
 class ProvenanceTests(unittest.TestCase):
@@ -172,13 +247,11 @@ class ProvenanceTests(unittest.TestCase):
 
     def datagen_line(self, bin_bytes, **fields):
         """A line as main.rs collector_main writes it."""
-        import hashlib
-
         ident = identity()
         rec = {
             "event": "file",
             "generator_id": 3,
-            "run_id": ident.run["run_id"],
+            "run_id": ident.run_id,
             "config_sha256": ident.config_sha256,
             "git_sha": ident.git_sha,
             "net_sha256": "n" * 64,
