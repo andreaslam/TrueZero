@@ -553,7 +553,7 @@ def parse_args(argv=None):
     parser.add_argument(
         "--allow-code-change",
         action="store_true",
-        help="start although the code is not at the run's pinned commit, or is dirty",
+        help="start although the code is not at the run's pinned commit",
     )
     return parser.parse_args(argv)
 

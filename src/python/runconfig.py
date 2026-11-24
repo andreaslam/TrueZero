@@ -235,20 +235,24 @@ def _log_start(hidden_dir, ident, used):
 
 def check_run_lock(hidden_dir, ident, allow_config_change=False, allow_code_change=False):
     """Check `ident` against the run lock, creating it on the first start, and log the
-    start. Returns the overrides that were needed; raises RunRefused otherwise.
+    start. Returns the warnings and overrides used; raises RunRefused otherwise.
 
     - a different run_id in the same data root is always refused;
-    - a different commit, uncommitted changes or an unknown commit need allow_code_change;
+    - a different commit or an unknown commit needs allow_code_change;
+    - uncommitted changes to tracked files only warn (and are logged as git_dirty);
     - a different run.toml needs allow_config_change.
     """
     os.makedirs(hidden_dir, exist_ok=True)
     lock_path = os.path.join(hidden_dir, "run_lock.json")
-    used = []
+    dirty_warning = (
+        ["warning: tracked files have uncommitted changes (logged as git_dirty)"]
+        if ident.git_dirty
+        else []
+    )
+    used = list(dirty_warning)
     code_problems = []
     if ident.git_sha == "unknown":
         code_problems.append("the git commit is unknown")
-    if ident.git_dirty:
-        code_problems.append("tracked files have uncommitted changes")
 
     if not os.path.exists(lock_path):
         if code_problems:
@@ -256,7 +260,8 @@ def check_run_lock(hidden_dir, ident, allow_config_change=False, allow_code_chan
                 raise RunRefused(
                     f"refusing to start run {ident.run['run_id']}: "
                     + "; ".join(code_problems)
-                    + ". Commit first, or pass --allow-code-change."
+                    + ". Run from a git checkout (or set TZ_BUILD_GIT_SHA), or pass "
+                    "--allow-code-change."
                 )
             used.append("allow-code-change: " + "; ".join(code_problems))
         run = ident.run
@@ -282,7 +287,7 @@ def check_run_lock(hidden_dir, ident, allow_config_change=False, allow_code_chan
             _log_start(hidden_dir, ident, used)
             return used
         except FileExistsError:
-            used = []  # someone else created it first: check against theirs
+            used = list(dirty_warning)  # someone else created it first: check theirs
 
     with open(lock_path) as f:
         lock = json.load(f)
@@ -343,7 +348,7 @@ def start_run(process, allow_config_change=False, allow_code_change=False, path=
         + (" (dirty)" if dirty else "")
     )
     for o in ident.overrides_used:
-        print(f"[run][Warning] override used: {o}")
+        print(f"[run][Warning] {o}")
     print(f"[run] effective [trainer]: {cfg['trainer']}")
     return cfg, ident
 

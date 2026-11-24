@@ -8,9 +8,10 @@
 # The run is frozen on first start: `hidden/run_lock.json` records the SHA-256 of this
 # file's bytes and the git commit. Afterwards the trainer (client.py) and self-play
 # (main) refuse to start if this file changed (any edit, even a comment) or the code is at
-# a different commit or has uncommitted changes. Overrides, for when you really mean it:
+# a different commit; uncommitted changes to tracked files only warn (logged as git_dirty).
+# Overrides, for when you really mean it:
 #   --allow-config-change   run.toml differs from the locked one
-#   --allow-code-change     different commit or uncommitted changes
+#   --allow-code-change     different (or unknown) commit
 # Every start, with any override used, is appended to `hidden/run_log.jsonl`.
 #
 # Every key below is required, and unknown keys are an error, so a typo cannot silently

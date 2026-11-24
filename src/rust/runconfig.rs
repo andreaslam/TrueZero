@@ -234,11 +234,12 @@ fn now_secs() -> f64 {
 }
 
 /// Checks `id` against the run lock in `hidden_dir`, creating the lock on the first start,
-/// and appends this start to `run_log.jsonl`. Returns the overrides that were needed.
+/// and appends this start to `run_log.jsonl`. Returns the warnings and overrides used.
 ///
 /// Rules (same as the Python trainer):
 /// - a different run_id in the same data root is always refused;
-/// - a different commit, uncommitted changes, or an unknown commit need `allow_code_change`;
+/// - a different commit, or an unknown commit, needs `allow_code_change`;
+/// - uncommitted changes to tracked files only warn (and are logged as `git_dirty`);
 /// - a different run.toml needs `allow_config_change`.
 pub fn check_run_lock(
     hidden_dir: &Path,
@@ -247,14 +248,14 @@ pub fn check_run_lock(
 ) -> Result<Vec<String>, String> {
     fs::create_dir_all(hidden_dir).map_err(|e| format!("{}: {e}", hidden_dir.display()))?;
     let lock_path = hidden_dir.join("run_lock.json");
-    let mut used = Vec::new();
+    let dirty_warning = id.git_dirty.then(|| {
+        "warning: tracked files have uncommitted changes (logged as git_dirty)".to_owned()
+    });
+    let mut used: Vec<String> = dirty_warning.iter().cloned().collect();
 
     let mut code_problems = Vec::new();
     if id.git_sha == "unknown" {
         code_problems.push("the git commit is unknown".to_owned());
-    }
-    if id.git_dirty {
-        code_problems.push("tracked files have uncommitted changes".to_owned());
     }
 
     let lock = match fs::read(&lock_path) {
@@ -271,12 +272,12 @@ pub fn check_run_lock(
                 created_at: now_secs(),
                 created_by: id.process.clone(),
             };
-            // Checked before the lock exists, so a dirty tree cannot become the pinned code.
+            // Checked before the lock exists, so an unknown commit cannot be pinned.
             if !code_problems.is_empty() {
                 if !overrides.allow_code_change {
                     return Err(format!(
-                        "refusing to start run {}: {}. Commit first, or pass \
-                         --allow-code-change.",
+                        "refusing to start run {}: {}. Build from a git checkout (or set \
+                         TZ_BUILD_GIT_SHA), or pass --allow-code-change.",
                         id.run.run_id,
                         code_problems.join("; ")
                     ));
@@ -304,7 +305,7 @@ pub fn check_run_lock(
                 }
                 // Another process created it first: check against theirs.
                 Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
-                    used.clear();
+                    used = dirty_warning.iter().cloned().collect();
                     let bytes = fs::read(&lock_path)
                         .map_err(|e| format!("{}: {e}", lock_path.display()))?;
                     serde_json::from_slice::<RunLock>(&bytes)
@@ -425,7 +426,7 @@ pub fn start_run(process: &str) -> (RunConfig, StartIdentity) {
         if id.git_dirty { " (dirty)" } else { "" }
     );
     for o in &used {
-        println!("[run][Warning] override used: {o}");
+        println!("[run][Warning] {o}");
     }
     println!("[run] effective [selfplay]: {:?}", cfg.selfplay);
     (cfg, id)
@@ -531,17 +532,18 @@ mod tests {
     }
 
     #[test]
-    fn dirty_tree_cannot_create_the_lock_without_override() {
+    fn dirty_tree_only_warns() {
         let (cfg, _) = example();
         let dir = temp_dir("dirty");
         let dirty = identity(&cfg, "abc", "a", true);
-        assert!(check_run_lock(&dir, &dirty, NONE).is_err());
-        assert!(!dir.join("run_lock.json").exists());
-        let allow = Overrides {
-            allow_code_change: true,
-            ..NONE
-        };
-        assert_eq!(check_run_lock(&dir, &dirty, allow).unwrap().len(), 1);
+        let notes = check_run_lock(&dir, &dirty, NONE).unwrap();
+        assert_eq!(notes.len(), 1);
+        assert!(notes[0].starts_with("warning:"));
+        assert!(dir.join("run_lock.json").exists());
+        // Still pinned: the same dirty tree at another commit is refused.
+        assert!(check_run_lock(&dir, &identity(&cfg, "def", "a", true), NONE).is_err());
+        let unknown = identity(&cfg, "unknown", "a", false);
+        assert!(check_run_lock(&temp_dir("unknown"), &unknown, NONE).is_err());
     }
 
     #[test]

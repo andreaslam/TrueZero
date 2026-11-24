@@ -166,8 +166,8 @@ Copy-Item observe.example.toml observe.toml   # optional: W&B, log tailing, ladd
 **run.toml is what the run is.** Self-play (`main`) and the trainer (`client.py`) both read
 it; every key is required. The first process to start writes `hidden/run_lock.json` with the
 run_id, the SHA-256 of run.toml and the git commit. Later starts are refused if run.toml
-changed, the code is at another commit or has uncommitted changes (commit first), or the
-run_id differs. `--allow-config-change` / `--allow-code-change` override the first two and
+changed, the code is at another commit, or the run_id differs. Uncommitted changes only
+warn (each start's `git_dirty` is logged). `--allow-config-change` / `--allow-code-change` override the first two and
 are recorded in `hidden/run_log.jsonl`. The old `TZ_NUM_GENERATORS`, `TZ_VIRTUAL_LEAVES`,
 `TZ_PCR_*` and `TZ_LR_*` variables are ignored with a warning (`Remove-Item
 Env:TZ_PCR_FULL_PROB` silences it).

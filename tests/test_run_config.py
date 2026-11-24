@@ -107,14 +107,16 @@ class RunLockTests(unittest.TestCase):
         with open(os.path.join(self.dir, "run_log.jsonl")) as f:
             self.assertEqual(len(f.readlines()), 2)
 
-    def test_dirty_tree_cannot_create_the_lock_without_override(self):
-        with self.assertRaises(runconfig.RunRefused):
-            runconfig.check_run_lock(self.dir, identity(dirty=True))
-        self.assertFalse(os.path.exists(os.path.join(self.dir, "run_lock.json")))
-        used = runconfig.check_run_lock(
-            self.dir, identity(dirty=True), allow_code_change=True
-        )
+    def test_dirty_tree_only_warns(self):
+        used = runconfig.check_run_lock(self.dir, identity(dirty=True))
         self.assertEqual(len(used), 1)
+        self.assertTrue(used[0].startswith("warning:"))
+        self.assertTrue(os.path.exists(os.path.join(self.dir, "run_lock.json")))
+        # Still pinned: another commit is refused even with a dirty tree.
+        with self.assertRaises(runconfig.RunRefused):
+            runconfig.check_run_lock(self.dir, identity(sha="def", dirty=True))
+        with self.assertRaises(runconfig.RunRefused):
+            runconfig.check_run_lock(tempfile.mkdtemp(dir=self.dir), identity(sha="unknown"))
 
     def test_other_commit_or_config_is_refused_unless_overridden(self):
         runconfig.check_run_lock(self.dir, identity())
