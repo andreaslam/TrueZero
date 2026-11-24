@@ -21,6 +21,10 @@ use tch::{Device, Kind, Tensor};
 /// How long the request handler waits for one more request before it flushes a partial batch.
 /// Defaults to 1 µs; `TZ_BATCH_TIMEOUT_US` overrides it, so larger batches can be A/B tested
 /// without a rebuild. Read once per process.
+///
+/// This is a gap since the last request, not a deadline: when requests arrive faster than the
+/// timeout, the batch fills to `max_batch_size` before it is flushed. `0` switches `executor_main`
+/// to pull batching instead (see [`gather_ready`]).
 pub fn partial_batch_timeout() -> Duration {
     static TIMEOUT: std::sync::OnceLock<Duration> = std::sync::OnceLock::new();
     *TIMEOUT.get_or_init(|| {
@@ -302,6 +306,34 @@ impl BatchBuffers {
     }
 }
 
+/// Pull batching (`TZ_BATCH_TIMEOUT_US=0`), as in kZero's executor loop: once the executor is free
+/// and has received one request, it takes every request already queued, up to `max_batch_size`,
+/// and runs them at once. No request waits for a batch to fill, and the batch is formed when the
+/// executor can run it, not while it is still busy with the previous one.
+fn gather_ready(
+    first: Packet,
+    receiver: &Receiver<Packet>,
+    max_batch_size: usize,
+) -> ExecutorPacket {
+    let mut pack = ExecutorPacket {
+        job: VecDeque::with_capacity(max_batch_size),
+        resenders: VecDeque::with_capacity(max_batch_size),
+        id: VecDeque::with_capacity(max_batch_size),
+    };
+    let mut next = Some(first);
+    while let Some(packet) = next {
+        pack.job.push_back(packet.job);
+        pack.resenders.push_back(packet.resender);
+        pack.id.push_back(packet.id);
+        next = if pack.job.len() < max_batch_size {
+            receiver.try_recv().ok()
+        } else {
+            None
+        };
+    }
+    pack
+}
+
 pub fn executor_main(
     net_receiver: Receiver<String>,
     tensor_receiver: Receiver<Packet>,
@@ -309,6 +341,29 @@ pub fn executor_main(
     evals_per_sec_sender: Option<Sender<CollectorMessage>>,
     executor_ready_sender: Option<Sender<bool>>,
     executor_id: usize,
+) {
+    run_executor(
+        net_receiver,
+        tensor_receiver,
+        max_batch_size,
+        evals_per_sec_sender,
+        executor_ready_sender,
+        executor_id,
+        partial_batch_timeout().is_zero(),
+    )
+}
+
+/// `executor_main` with the batching mode passed in: `pull` gathers each batch with
+/// [`gather_ready`] when the executor is free; otherwise a handler thread forms batches with
+/// [`handle_requests`].
+pub(crate) fn run_executor(
+    net_receiver: Receiver<String>,
+    tensor_receiver: Receiver<Packet>,
+    max_batch_size: usize,
+    evals_per_sec_sender: Option<Sender<CollectorMessage>>,
+    executor_ready_sender: Option<Sender<bool>>,
+    executor_id: usize,
+    pull: bool,
 ) {
     let mut graph_disconnected = false;
     let mut network: Option<Net> = None;
@@ -326,13 +381,16 @@ pub fn executor_main(
     let mut buffers: Option<BatchBuffers> = None;
 
     thread::scope(|s| {
-        let _ = s
-            .builder()
-            .name(format!("executor-wait-{}", executor_id).to_string())
-            .spawn(move |_| {
-                handle_requests(handler_send, tensor_receiver, max_batch_size);
-            })
-            .unwrap();
+        if !pull {
+            let tensor_receiver = tensor_receiver.clone();
+            let _ = s
+                .builder()
+                .name(format!("executor-wait-{}", executor_id).to_string())
+                .spawn(move |_| {
+                    handle_requests(handler_send, tensor_receiver, max_batch_size);
+                })
+                .unwrap();
+        }
 
         loop {
             let mut selector = Selector::new();
@@ -346,12 +404,22 @@ pub fn executor_main(
             }
 
             if let Some(_) = network {
-                selector = selector.recv(&handler_recv, Message::JobTensorExecutor);
+                selector = if pull {
+                    selector.recv(&tensor_receiver, Message::JobTensor)
+                } else {
+                    selector.recv(&handler_recv, Message::JobTensorExecutor)
+                };
             }
 
             let wait_start = Instant::now();
             let message = selector.wait();
             stats.waiting += wait_start.elapsed();
+            let message = match message {
+                Message::JobTensor(first) => Message::JobTensorExecutor(
+                    first.map(|first| gather_ready(first, &tensor_receiver, max_batch_size)),
+                ),
+                message => message,
+            };
 
             match message {
                 Message::StopServer => break,

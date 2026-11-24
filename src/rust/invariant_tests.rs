@@ -866,8 +866,20 @@ fn pcr2_selfplay_records_full_and_fast_searches() {
 /// position on its own through `eval_state`, using a real TorchScript network on the CPU.
 #[test]
 fn x1_executor_returns_each_request_its_own_outputs() {
+    check_executor_returns_each_request_its_own_outputs(false);
+}
+
+/// X2: X1 with pull batching (`TZ_BATCH_TIMEOUT_US=0`), where the executor gathers each batch
+/// itself from the queue when it is free. The requests are queued before the network is sent, so
+/// the first batches are full (4) and the last one partial (2).
+#[test]
+fn x2_pull_batching_returns_each_request_its_own_outputs() {
+    check_executor_returns_each_request_its_own_outputs(true);
+}
+
+fn check_executor_returns_each_request_its_own_outputs(pull: bool) {
     use crate::decoder::{board_input, eval_state};
-    use crate::executor::executor_main;
+    use crate::executor::run_executor;
     use crate::mcts_trainer::Net;
 
     let net_path = concat!(env!("CARGO_MANIFEST_DIR"), "/../python/nets/tz_6515.pt");
@@ -900,8 +912,7 @@ fn x1_executor_returns_each_request_its_own_outputs() {
     let (net_send, net_recv) = flume::unbounded::<String>();
     let (job_send, job_recv) = flume::unbounded::<Packet>();
     // batches of at most 4, so 10 requests need at least 3 batches through the same buffers
-    std::thread::spawn(move || executor_main(net_recv, job_recv, 4, None, None, 0));
-    net_send.send(net_path.to_string()).unwrap();
+    std::thread::spawn(move || run_executor(net_recv, job_recv, 4, None, None, 0, pull));
 
     let receivers: Vec<_> = positions
         .iter()
@@ -918,6 +929,7 @@ fn x1_executor_returns_each_request_its_own_outputs() {
             rx
         })
         .collect();
+    net_send.send(net_path.to_string()).unwrap();
 
     for (i, (rx, (value, policy))) in receivers.iter().zip(&expected).enumerate() {
         let ReturnMessage::ReturnMessage(reply) = rx
