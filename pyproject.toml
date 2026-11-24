@@ -59,6 +59,12 @@ tools = [
 package = false
 default-groups = ["torch", "gui", "viz", "tools", "telemetry"]
 conflicts = [[{ group = "torch" }, { group = "tch" }]]
+# The lock must install on the training machine (Windows) as well as Linux/Docker. Without
+# this, uv may pick versions with no Windows wheel (pyqt5-qt5 5.15.19 is Linux/macOS only).
+required-environments = [
+    "sys_platform == 'win32' and platform_machine == 'AMD64'",
+    "sys_platform == 'linux' and platform_machine == 'x86_64'",
+]
 
 [tool.maturin]
 manifest-path = "src/rust/Cargo.toml"
