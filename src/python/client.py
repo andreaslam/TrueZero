@@ -10,6 +10,7 @@ import time
 import warnings
 
 import network as network
+import numpy as np
 import torch
 
 # the Rust self-play engine loads TorchScript (.pt) via libtorch, so torch.export is not
@@ -102,8 +103,58 @@ def model_weights_checksum(model):
     return checksum.hexdigest()
 
 
+class FullSearchPolicyFile(DataFile):
+    """A replay file whose fast-search positions carry no policy target.
+
+    With playout cap randomisation most moves are fast searches (few visits, no
+    root noise, possibly stopped early). Their visit distribution is close to the
+    network's own policy, so training the policy on it mostly teaches the net to
+    copy itself; KataGo trains the policy on full searches only. The inherited
+    trainer ignores `is_full_search`, so here every fast-search position gets
+    policy values of -1, lib's own marker for "no policy target": such a row
+    adds no policy loss or gradient and is left out of policy accuracy. Value,
+    WDL and moves-left targets are unchanged. Neither lib nor the file format is
+    modified, and this applies to files already in the replay buffer.
+    """
+
+    def load_position(self, pi):
+        position = super().load_position(pi)
+        if not position.is_full_search:
+            position.policy_values = np.full_like(position.policy_values, -1.0)
+        return position
+
+    def with_new_handles(self):
+        # The samplers reopen files through this, so it must keep the subclass.
+        other = super().with_new_handles()
+        return FullSearchPolicyFile(other.info, other.bin_handle, other.off_handle)
+
+
 def load_file(games_path):
-    return DataFile.open(Game.find("chess"), games_path)
+    f = DataFile.open(Game.find("chess"), games_path)
+    return FullSearchPolicyFile(f.info, f.bin_handle, f.off_handle)
+
+
+# Weight of the policy loss per position that has a policy target.
+POLICY_WEIGHT = 1.0
+
+
+def policy_target_fraction(batch):
+    """Fraction of the batch's positions that have a policy target (full searches)."""
+    has_target = (batch.policy_values != -1).any(dim=1)
+    return has_target.float().mean().item()
+
+
+def set_policy_weight(train_settings, batch):
+    """Keep the policy's share of the loss independent of how many positions are masked.
+
+    lib averages the policy loss over the whole batch, so masking fast searches
+    (FullSearchPolicyFile) would shrink it by the full-search fraction p and shift
+    the balance towards value. Scaling by 1/p restores the per-target weight it had
+    before playout cap randomisation. Returns p.
+    """
+    fraction = policy_target_fraction(batch)
+    train_settings.policy_weight = POLICY_WEIGHT / max(fraction, 1.0 / len(batch))
+    return fraction
 
 
 HOST = os.environ.get("TZ_SERVER_HOST", "127.0.0.1")
@@ -271,6 +322,7 @@ class LrSchedule:
 def scheduled_train_step(train_settings, batch, model, op, schedule, log):
     """One optimiser step at the scheduled learning rate."""
     lr = schedule.apply(op)
+    fraction = set_policy_weight(train_settings, batch)
     train_settings.train_step(
         batch,
         network=model,
@@ -281,6 +333,7 @@ def scheduled_train_step(train_settings, batch, model, op, schedule, log):
     log.log("schedule", "lr", lr)
     # Separate group so the plotter does not draw lr against a count in the millions.
     log.log("samples", "trained", schedule.samples_trained)
+    log.log("policy-targets", "fraction", fraction)
 
 
 def save_trainer_state(model, op, schedule, accepted_gen, candidate_gen, path=None):
@@ -499,7 +552,7 @@ def main():
         wdl_weight=1.0,
         moves_left_weight=0.1,
         moves_left_delta=0.1,
-        policy_weight=1,
+        policy_weight=POLICY_WEIGHT,
         sim_weight=0.0,
         train_in_eval_mode=False,
         clip_norm=5.0,
@@ -1173,6 +1226,7 @@ def test_net(
 
         test_batch = test_sampler.next_batch()
 
+        set_policy_weight(train_settings, test_batch)
         train_settings.evaluate_batch(
             network=model,
             batch=test_batch,
@@ -1182,6 +1236,7 @@ def test_net(
 
         last_gen_test_batch = last_gen_test_sampler.next_batch()
 
+        set_policy_weight(train_settings, last_gen_test_batch)
         train_settings.evaluate_batch(
             network=model,
             batch=last_gen_test_batch,
