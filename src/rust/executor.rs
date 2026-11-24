@@ -18,7 +18,21 @@ use std::{
 };
 use tch::{Device, Kind, Tensor};
 
-const PARTIAL_BATCH_TIMEOUT: Duration = Duration::from_micros(1);
+/// How long the request handler waits for one more request before it flushes a partial batch.
+/// Defaults to 1 µs; `TZ_BATCH_TIMEOUT_US` overrides it, so larger batches can be A/B tested
+/// without a rebuild. Read once per process.
+pub fn partial_batch_timeout() -> Duration {
+    static TIMEOUT: std::sync::OnceLock<Duration> = std::sync::OnceLock::new();
+    *TIMEOUT.get_or_init(|| {
+        let micros = match std::env::var("TZ_BATCH_TIMEOUT_US") {
+            Ok(value) => value.trim().parse::<u64>().unwrap_or_else(|_| {
+                panic!("TZ_BATCH_TIMEOUT_US must be a whole number of microseconds, got {value:?}")
+            }),
+            Err(_) => 1,
+        };
+        Duration::from_micros(micros)
+    })
+}
 pub const TEMP_NETWORK_PREFIX: &str = "tz_temp_net_";
 
 pub struct Packet {
@@ -183,7 +197,7 @@ fn handle_requests(
     };
 
     loop {
-        match tensor_receiver.recv_timeout(PARTIAL_BATCH_TIMEOUT) {
+        match tensor_receiver.recv_timeout(partial_batch_timeout()) {
             Ok(job) => {
                 input_vec.push_back(job.job);
                 output_senders.push_back(job.resender);

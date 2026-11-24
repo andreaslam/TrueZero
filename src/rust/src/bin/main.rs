@@ -18,7 +18,7 @@ use tzrust::{
     data_path, data_path_str,
     dataformat::ZeroEvaluationAbs,
     debug_print,
-    executor::{executor_main, Packet, TEMP_NETWORK_PREFIX},
+    executor::{executor_main, partial_batch_timeout, Packet, TEMP_NETWORK_PREFIX},
     fileformat::BinaryOutput,
     mcts_trainer::{EvalMode, TypeRequest::TrainerSearch},
     message_types::{DataFileType, Entity, MessageServer, MessageType, Statistics},
@@ -147,7 +147,8 @@ fn main() {
     let num_generators = env_usize("TZ_NUM_GENERATORS", 2 * batch_size);
     println!(
         "[Datagen] {num_executors} executor(s), {num_generators} generators, \
-         batch size {batch_size}"
+         batch size {batch_size}, partial-batch timeout {:?}",
+        partial_batch_timeout()
     );
 
     let (game_sender, game_receiver) = flume::bounded::<CollectorMessage>(num_generators);
@@ -403,8 +404,12 @@ fn collector_main(
                 }
             }
             CollectorMessage::GeneratorStatistics(nps) => {
-                if nps_start_time.elapsed() >= Duration::from_secs(1) {
-                    let nps: usize = nps_vec.iter().sum();
+                // Report a rate: the visits counted in this window divided by its real length.
+                nps_vec.push(nps);
+                let elapsed = nps_start_time.elapsed();
+                if elapsed >= Duration::from_secs(1) {
+                    let nps =
+                        (nps_vec.iter().sum::<usize>() as f64 / elapsed.as_secs_f64()) as usize;
                     nps_start_time = Instant::now();
                     nps_vec = Vec::new();
                     let message = MessageServer {
@@ -414,13 +419,15 @@ fn collector_main(
                         serde_json::to_string(&message).expect("serialisation failed");
                     serialised += "\n";
                     server_handle.write_all(serialised.as_bytes()).unwrap();
-                } else {
-                    nps_vec.push(nps);
                 }
             }
             CollectorMessage::ExecutorStatistics(evals_per_sec) => {
-                if evals_start_time.elapsed() >= Duration::from_secs(1) {
-                    let evals_per_second: usize = evals_vec.iter().sum();
+                // Same as above: evaluations in this window divided by its real length.
+                evals_vec.push(evals_per_sec);
+                let elapsed = evals_start_time.elapsed();
+                if elapsed >= Duration::from_secs(1) {
+                    let evals_per_second =
+                        (evals_vec.iter().sum::<usize>() as f64 / elapsed.as_secs_f64()) as usize;
                     evals_start_time = Instant::now();
                     evals_vec = Vec::new();
                     let message = MessageServer {
@@ -432,8 +439,6 @@ fn collector_main(
                         serde_json::to_string(&message).expect("serialisation failed");
                     serialised += "\n";
                     server_handle.write_all(serialised.as_bytes()).unwrap();
-                } else {
-                    evals_vec.push(evals_per_sec);
                 }
             }
             CollectorMessage::GameResult(_) => {}
