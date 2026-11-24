@@ -18,11 +18,20 @@ fn git(args: &[&str]) -> Option<String> {
 }
 
 fn main() {
-    let sha = git(&["rev-parse", "HEAD"]).unwrap_or_else(|| "unknown".into());
+    // Builds without a .git directory (the Docker image) pass the commit in instead.
+    println!("cargo:rerun-if-env-changed=TZ_BUILD_GIT_SHA");
+    let injected = std::env::var("TZ_BUILD_GIT_SHA")
+        .ok()
+        .filter(|s| !s.is_empty() && s != "unknown");
+    let sha = injected
+        .clone()
+        .or_else(|| git(&["rev-parse", "HEAD"]))
+        .unwrap_or_else(|| "unknown".into());
     // Untracked files (run.toml, nets/, ...) do not make the tree dirty.
-    let dirty = match git(&["status", "--porcelain", "--untracked-files=no"]) {
-        Some(s) => !s.is_empty(),
-        None => true,
+    let dirty = match (&injected, git(&["status", "--porcelain", "--untracked-files=no"])) {
+        (Some(_), _) => false,
+        (None, Some(s)) => !s.is_empty(),
+        (None, None) => true,
     };
     println!("cargo:rustc-env=TZ_GIT_SHA={sha}");
     println!("cargo:rustc-env=TZ_GIT_DIRTY={}", dirty as u8);

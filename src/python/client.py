@@ -26,6 +26,7 @@ from lib.logger import Logger
 from lib.loop import LoopBuffer
 from lib.train import ScalarTarget, TrainSettings
 from paths import data_dir, data_path
+from ladder import LadderRunner
 from runconfig import record_received_file, start_run
 from telemetry import (
     LogTailer,
@@ -617,6 +618,7 @@ def main():
         resolve_data_paths(observe["tail"]["logs"]),
         flush_seconds=float(observe["tail"]["flush_seconds"]),
     ).start()
+    ladder = LadderRunner(observe["ladder"], TELEMETRY)
     seed_everything(run_cfg["run"]["seed"])
 
     game = Game.find("chess")
@@ -821,6 +823,11 @@ def main():
                     )
 
                     print(f"[Training] Candidate accepted: {accepted_model_path}")
+                    # Training is paused while a candidate is pending, so the schedule's
+                    # position is exactly the samples this net was trained on.
+                    ladder.maybe_run(
+                        accepted_model_path, accepted_gen, schedule.samples_trained
+                    )
 
                     pending_candidate_path = None
                     pending_candidate_gen = None

@@ -97,7 +97,7 @@ class TelemetryTests(unittest.TestCase):
         wandb_id = fake.init_kwargs["id"]
         self.assertEqual(fake.init_kwargs["group"], "base")
         self.assertEqual(fake.init_kwargs["resume"], "allow")
-        with open(os.path.join(self.dir, "hidden", "wandb_run_id")) as f:
+        with open(os.path.join(self.dir, "hidden", "wandb_run_id.branch-pcr")) as f:
             self.assertEqual(f.read(), wandb_id)
         again = FakeWandb()
         online(again, cfg)
@@ -105,6 +105,7 @@ class TelemetryTests(unittest.TestCase):
         root = FakeWandb()
         online(root, {"run": {"run_id": "base", "parent_run_id": ""}})
         self.assertEqual(root.init_kwargs["group"], "base")
+        self.assertNotEqual(root.init_kwargs["id"], wandb_id)  # never the branch's run
 
     def test_a_failing_wandb_never_raises(self):
         fake = FakeWandb()

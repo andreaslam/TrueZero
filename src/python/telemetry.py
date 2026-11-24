@@ -8,7 +8,7 @@ is a no-op and training is unaffected. ``mode = "offline"`` writes runs locally
 
 Everything is logged against ``samples_trained`` (the LR schedule's position), never
 wall-clock, so runs compare across hardware and restarts. One W&B run per TrueZero run:
-its id is kept in ``hidden/wandb_run_id`` so a restarted trainer resumes the same W&B run;
+its id is kept in ``hidden/wandb_run_id.<run_id>`` so a restarted trainer resumes the same W&B run;
 the W&B group is the parent run (or the run itself), so branches sit with their parent.
 
 Also here, because they feed the logs:
@@ -107,7 +107,9 @@ class Telemetry:
     def _init(wandb, observe, run_cfg, identity, mode):
         run = (run_cfg or {}).get("run", {})
         run_id = run.get("run_id", "truezero")
-        id_path = data_path("hidden/wandb_run_id")
+        # Keyed by run_id, so a branch started from a copy of its parent's hidden/ gets
+        # its own W&B run instead of resuming the parent's.
+        id_path = data_path(f"hidden/wandb_run_id.{run_id}")
         if os.path.exists(id_path):
             with open(id_path) as f:
                 wandb_id = f.read().strip()

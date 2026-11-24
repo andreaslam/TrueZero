@@ -169,7 +169,8 @@ def refuse_retired_env_vars(environ=os.environ):
 
 def git_state(repo=REPO_ROOT):
     """(commit, dirty) of the working tree the trainer runs from. Untracked files do not
-    count as dirty. ("unknown", True) if git is unavailable."""
+    count as dirty. Without a repository, TZ_BUILD_GIT_SHA (set in the Docker image) or
+    ("unknown", True)."""
 
     def git(*args):
         out = subprocess.run(
@@ -187,6 +188,10 @@ def git_state(repo=REPO_ROOT):
         dirty = git("status", "--porcelain", "--untracked-files=no") != ""
         return sha, dirty
     except (OSError, subprocess.SubprocessError):
+        # No repository (the Docker image): the commit the image was built from.
+        injected = os.environ.get("TZ_BUILD_GIT_SHA", "")
+        if injected and injected != "unknown":
+            return injected, False
         return "unknown", True
 
 
