@@ -2,9 +2,10 @@
 
 Configured by ``<data root>/observe.toml`` (template: ``observe.example.toml``), which is
 NOT part of the run identity: how a run is watched can change mid-run, what it is cannot.
-Without the file, with ``mode = "off"``, or without the ``wandb`` package, every call here
-is a no-op and training is unaffected. ``mode = "offline"`` writes runs locally
-(``wandb sync`` uploads them later).
+W&B is on by default (project ``truezero``, your default entity). Online logging needs a
+W&B login (``wandb login`` once, or ``WANDB_API_KEY``); without one the trainer never
+prompts, it logs offline instead (``wandb sync`` uploads later). With ``mode = "off"`` or
+without the ``wandb`` package every call here is a no-op and training is unaffected.
 
 Everything is logged against ``samples_trained`` (the LR schedule's position), never
 wall-clock, so runs compare across hardware and restarts. One W&B run per TrueZero run:
@@ -36,7 +37,7 @@ except ModuleNotFoundError:  # Python 3.10
 from paths import data_path
 
 OBSERVE_DEFAULTS = {
-    "wandb": {"mode": "off", "project": "truezero", "entity": ""},
+    "wandb": {"mode": "online", "project": "truezero", "entity": ""},
     "tail": {"logs": [], "flush_seconds": 60.0},
     "ladder": {
         "enabled": False,
@@ -76,10 +77,36 @@ def load_observe_config(path=None):
     return cfg
 
 
+def wandb_key_available(environ=os.environ, home=None):
+    """Whether W&B has an API key, without contacting it or prompting: WANDB_API_KEY, or an
+    api.wandb.ai entry in the netrc file `wandb login` writes (~/.netrc, ~/_netrc on
+    Windows, or $NETRC)."""
+    if environ.get("WANDB_API_KEY"):
+        return True
+    home = home or os.path.expanduser("~")
+    candidates = [environ.get("NETRC"), os.path.join(home, ".netrc"), os.path.join(home, "_netrc")]
+    host = environ.get("WANDB_BASE_URL", "https://api.wandb.ai").split("//")[-1].split("/")[0]
+    for path in filter(None, candidates):
+        try:
+            with open(path) as f:
+                if host in f.read():
+                    return True
+        except OSError:
+            pass
+    return False
+
+
 class Telemetry:
     """Thread-safe front for W&B. Never raises into the trainer."""
 
-    def __init__(self, observe, run_cfg=None, identity=None, wandb_module=None):
+    def __init__(
+        self,
+        observe,
+        run_cfg=None,
+        identity=None,
+        wandb_module=None,
+        key_check=wandb_key_available,
+    ):
         self.samples_trained = 0
         self._lock = threading.Lock()
         self._wandb = None
@@ -91,6 +118,13 @@ class Telemetry:
         if mode not in ("online", "offline"):
             print(f"[telemetry][Warning] unknown W&B mode {mode!r}; telemetry is off")
             return
+        if mode == "online" and not key_check():
+            # wandb.init would stop and ask for a key; a trainer must never wait on that.
+            print(
+                "[telemetry] no W&B login found (run `wandb login` once, or set "
+                "WANDB_API_KEY); logging offline for now, upload later with `wandb sync`"
+            )
+            mode = "offline"
         if wandb_module is None:
             try:
                 import wandb as wandb_module

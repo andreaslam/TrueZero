@@ -42,7 +42,7 @@ viz = [
     "pillow>=10",
     "tensorboard>=2.16",
 ]
-# Optional W&B telemetry (observe.toml [wandb]); training runs without it.
+# W&B telemetry (observe.toml [wandb]); installed by default, training runs without it.
 telemetry = [
     "wandb>=0.19",
 ]
@@ -57,7 +57,7 @@ tools = [
 # The Python side is a set of scripts, not an installable package; don't build the
 # Rust extension (maturin) on `uv sync`.
 package = false
-default-groups = ["torch", "gui", "viz", "tools"]
+default-groups = ["torch", "gui", "viz", "tools", "telemetry"]
 conflicts = [[{ group = "torch" }, { group = "tch" }]]
 
 [tool.maturin]

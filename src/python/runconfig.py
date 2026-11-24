@@ -85,8 +85,9 @@ SCHEMA = {
     },
 }
 
-# Environment variables that used to set run hyperparameters; refused so a value left in a
-# PowerShell session cannot silently change a run.
+# Environment variables that used to set run hyperparameters. They have no effect any more;
+# a start that finds one warns, so a value left in a PowerShell session is noticed but can
+# neither change a run nor block a start.
 RETIRED_ENV_VARS = {
     "TZ_LR_SCHEDULE": "[trainer] lr_schedule",
     "TZ_LR_WARMUP_SAMPLES": "[trainer] lr_warmup_samples",
@@ -157,14 +158,16 @@ def load_run_config(path):
     return cfg, hashlib.sha256(raw).hexdigest()
 
 
-def refuse_retired_env_vars(environ=os.environ):
+def retired_env_var_warning(environ=os.environ):
+    """A warning naming every retired variable that is set, or None. They are ignored."""
     found = [f"{n} (now run.toml {k})" for n, k in RETIRED_ENV_VARS.items() if n in environ]
-    if found:
-        raise RunRefused(
-            "these environment variables no longer configure a run: "
-            + ", ".join(found)
-            + ". Remove them (PowerShell: Remove-Item Env:NAME) and set the value in run.toml."
-        )
+    if not found:
+        return None
+    return (
+        "IGNORING environment variables that no longer configure a run: "
+        + ", ".join(found)
+        + ". run.toml decides; remove them (PowerShell: Remove-Item Env:NAME) to silence this."
+    )
 
 
 def git_state(repo=REPO_ROOT):
@@ -321,7 +324,8 @@ def start_run(process, allow_config_change=False, allow_code_change=False, path=
     """Load run.toml, refuse retired env vars, check the run lock and print the effective
     config. Returns (config, StartIdentity). Exits with a message on refusal."""
     try:
-        refuse_retired_env_vars()
+        if (warning := retired_env_var_warning()) is not None:
+            print(f"[run][Warning] {warning}", file=sys.stderr)
         path = path or data_path("run.toml")
         cfg, sha = load_run_config(path)
         git_sha, dirty = git_state()

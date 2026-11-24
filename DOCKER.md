@@ -97,7 +97,7 @@ The following variables are runtime configuration and do not require rebuilding:
 Training-run hyperparameters (self-play generators, virtual leaves, PCR, search and trainer
 settings) are no longer environment variables: they live in `/data/run.toml` (copy
 `run.example.toml` from the repository) and the old `TZ_NUM_GENERATORS`, `TZ_VIRTUAL_LEAVES`,
-`TZ_PCR_*` and `TZ_LR_*` variables are refused. The image records the commit it was built from
+`TZ_PCR_*` and `TZ_LR_*` variables are ignored with a warning. The image records the commit it was built from
 (`--build-arg TZ_BUILD_GIT_SHA=$(git rev-parse HEAD)`; CI passes it), which pins the run. See
 "Training runs" in the README.
 

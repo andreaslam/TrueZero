@@ -31,8 +31,9 @@ pub const GIT_SHA: &str = env!("TZ_GIT_SHA");
 /// Whether tracked files had uncommitted changes when this binary was built.
 pub const GIT_DIRTY: bool = matches!(env!("TZ_GIT_DIRTY").as_bytes(), b"1");
 
-/// Environment variables that used to set run hyperparameters. They are refused so that a
-/// value left over in a PowerShell session cannot silently change a run.
+/// Environment variables that used to set run hyperparameters. They have no effect any more;
+/// a start that finds one warns, so a value left in a PowerShell session is noticed but can
+/// neither change a run nor block a start.
 /// (The trainer refuses its own, TZ_LR_SCHEDULE and TZ_LR_WARMUP_SAMPLES.)
 pub const RETIRED_ENV_VARS: [(&str, &str); 5] = [
     ("TZ_NUM_GENERATORS", "[selfplay] num_generators"),
@@ -169,22 +170,21 @@ impl RunConfig {
     }
 }
 
-/// Fails if a retired run-hyperparameter environment variable is set.
-pub fn refuse_retired_env_vars() -> Result<(), String> {
+/// A warning naming every retired run-hyperparameter environment variable that is set, or
+/// `None`. They are ignored: run.toml decides.
+pub fn retired_env_var_warning() -> Option<String> {
     let set: Vec<String> = RETIRED_ENV_VARS
         .iter()
         .filter(|(name, _)| std::env::var_os(name).is_some())
         .map(|(name, key)| format!("{name} (now run.toml {key})"))
         .collect();
-    if set.is_empty() {
-        Ok(())
-    } else {
-        Err(format!(
-            "these environment variables no longer configure a run: {}. Remove them \
-             (PowerShell: Remove-Item Env:NAME) and set the value in run.toml.",
+    (!set.is_empty()).then(|| {
+        format!(
+            "IGNORING environment variables that no longer configure a run: {}. run.toml \
+             decides; remove them (PowerShell: Remove-Item Env:NAME) to silence this.",
             set.join(", ")
-        ))
-    }
+        )
+    })
 }
 
 /// Who is starting, with what code and config.
@@ -400,7 +400,9 @@ pub fn start_run(process: &str) -> (RunConfig, StartIdentity) {
         eprintln!("[run] {msg}");
         std::process::exit(2)
     };
-    refuse_retired_env_vars().unwrap_or_else(|e| fail(e));
+    if let Some(w) = retired_env_var_warning() {
+        eprintln!("[run][Warning] {w}");
+    }
     let path = run_config_path();
     let (cfg, config_sha256) = load_run_config(&path).unwrap_or_else(|e| fail(e));
     let id = StartIdentity {

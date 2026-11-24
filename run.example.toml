@@ -14,8 +14,10 @@
 # Every start, with any override used, is appended to `hidden/run_log.jsonl`.
 #
 # Every key below is required, and unknown keys are an error, so a typo cannot silently
-# fall back to a default. The values below are the defaults the code used before this
-# file existed.
+# fall back to a default. The old TZ_* variables for these settings (TZ_PCR_*,
+# TZ_VIRTUAL_LEAVES, TZ_NUM_GENERATORS, TZ_LR_*) have no effect: a start that finds one
+# set prints a warning and uses this file. The values below are the defaults the code
+# used before this file existed.
 #
 # Not in here (so they can change mid-run): TZ_SERVER_HOST/PORT, TZ_DEVICE,
 # TZ_DATA_ROOT, the executor knobs TZ_NUM_EXECUTORS and TZ_BATCH_TIMEOUT_US (throughput

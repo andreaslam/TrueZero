@@ -74,14 +74,38 @@ class TelemetryTests(unittest.TestCase):
     def tearDown(self):
         shutil.rmtree(self.dir)
 
-    def test_off_by_default_and_without_wandb(self):
-        t = telemetry.Telemetry(telemetry.load_observe_config("/nonexistent"))
+    def test_on_by_default(self):
+        cfg = telemetry.load_observe_config("/nonexistent")
+        self.assertEqual(cfg["wandb"]["mode"], "online")
+        self.assertEqual(cfg["wandb"]["project"], "truezero")
+
+    def test_off_and_without_wandb_are_no_ops(self):
+        observe = telemetry.load_observe_config("/nonexistent")
+        observe["wandb"]["mode"] = "off"
+        t = telemetry.Telemetry(observe)
         self.assertFalse(t.enabled)
         t.log({"x": 1.0})  # no-op, no error
-        observe = telemetry.load_observe_config("/nonexistent")
         observe["wandb"]["mode"] = "online"
         with mock.patch.dict("sys.modules", {"wandb": None}):
-            self.assertFalse(telemetry.Telemetry(observe).enabled)
+            self.assertFalse(telemetry.Telemetry(observe, key_check=lambda: True).enabled)
+
+    def test_online_without_a_login_falls_back_to_offline_instead_of_prompting(self):
+        observe = telemetry.load_observe_config("/nonexistent")
+        fake = FakeWandb()
+        telemetry.Telemetry(observe, wandb_module=fake, key_check=lambda: False)
+        self.assertEqual(fake.init_kwargs["mode"], "offline")
+        fake = FakeWandb()
+        telemetry.Telemetry(observe, wandb_module=fake, key_check=lambda: True)
+        self.assertEqual(fake.init_kwargs["mode"], "online")
+
+    def test_key_detection(self):
+        home = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, home)
+        self.assertFalse(telemetry.wandb_key_available({}, home))
+        self.assertTrue(telemetry.wandb_key_available({"WANDB_API_KEY": "k"}, home))
+        with open(os.path.join(home, "_netrc"), "w") as f:  # Windows name
+            f.write("machine api.wandb.ai\n  login user\n  password k\n")
+        self.assertTrue(telemetry.wandb_key_available({}, home))
 
     def test_rows_carry_samples_trained_and_drop_nan(self):
         fake = FakeWandb()

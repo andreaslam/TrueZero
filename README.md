@@ -169,7 +169,8 @@ run_id, the SHA-256 of run.toml and the git commit. Later starts are refused if 
 changed, the code is at another commit or has uncommitted changes (commit first), or the
 run_id differs. `--allow-config-change` / `--allow-code-change` override the first two and
 are recorded in `hidden/run_log.jsonl`. The old `TZ_NUM_GENERATORS`, `TZ_VIRTUAL_LEAVES`,
-`TZ_PCR_*` and `TZ_LR_*` variables are refused (`Remove-Item Env:TZ_PCR_FULL_PROB`).
+`TZ_PCR_*` and `TZ_LR_*` variables are ignored with a warning (`Remove-Item
+Env:TZ_PCR_FULL_PROB` silences it).
 `TZ_NUM_EXECUTORS` and `TZ_BATCH_TIMEOUT_US` stay env vars: they only change throughput.
 
 A branch of a run (same commit, different hyperparameters) is a new data root with its own
@@ -183,7 +184,10 @@ file) join on `bin_sha256`.
 
 **observe.toml is how the run is watched** and can change any time:
 
-- `[wandb]`: `mode = "offline"` or `"online"` after `uv sync --group telemetry`. Metrics
+- `[wandb]`: on by default (`mode = "online"`, project `truezero`, your default entity,
+  run name = `run_id`, group = `parent_run_id` or `run_id`). Log in once with
+  `uv run wandb login`; without a login the trainer logs offline rather than prompting
+  (`wandb sync hidden/wandb/offline-run-*` uploads later). `mode = "off"` disables it. Metrics
   are plotted against samples trained: losses, policy accuracy (full searches only),
   policy entropy, LR, buffer age, gate results, per-file game length, draw rate and the
   first-move distribution, and (with `[tail]`) nodes/s, evals/s and executor timings

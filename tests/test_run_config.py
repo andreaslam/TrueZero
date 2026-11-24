@@ -72,10 +72,20 @@ class RunConfigTests(unittest.TestCase):
         _, sha = runconfig.load_run_config(EXAMPLE)
         self.assertEqual(sha, hashlib.sha256(EXAMPLE.read_bytes()).hexdigest())
 
-    def test_retired_env_vars_are_refused(self):
-        with self.assertRaises(runconfig.RunRefused):
-            runconfig.refuse_retired_env_vars({"TZ_LR_SCHEDULE": "0:1e-3"})
-        runconfig.refuse_retired_env_vars({"TZ_SERVER_PORT": "1", "TZ_NUM_EXECUTORS": "2"})
+    def test_retired_env_vars_warn_and_are_ignored(self):
+        w = runconfig.retired_env_var_warning({"TZ_LR_SCHEDULE": "0:1e-3"})
+        self.assertIn("TZ_LR_SCHEDULE", w)
+        self.assertIn("lr_schedule", w)
+        self.assertIsNone(
+            runconfig.retired_env_var_warning({"TZ_SERVER_PORT": "1", "TZ_NUM_EXECUTORS": "2"})
+        )
+        # The trainer's settings come from run.toml whatever the environment says.
+        cfg, _ = runconfig.load_run_config(EXAMPLE)
+        with mock.patch.dict(os.environ, {"TZ_LR_SCHEDULE": "0:9"}), mock.patch.multiple(
+            client, LR_SCHEDULE=client.LR_SCHEDULE, LR_WARMUP_SAMPLES=client.LR_WARMUP_SAMPLES
+        ), mock.patch.dict(client.LOSS_WEIGHTS):
+            client.apply_run_config(cfg)
+            self.assertEqual(client.LR_SCHEDULE, cfg["trainer"]["lr_schedule"])
 
 
 class RunLockTests(unittest.TestCase):
