@@ -33,7 +33,7 @@ RUN --mount=type=cache,target=/root/.cache/uv \
 ENV PATH="/opt/venv/bin:${PATH}" \
     LIBTORCH="$(python3 -c 'import torch; print(torch.__path__[0])')"
 
-# The commit being built (.git is not in the build context); pins runs (run.example.toml).
+# The commit being built (.git is not in the build context); recorded in each run (runs/<id>/run.json).
 ARG TZ_BUILD_GIT_SHA=unknown
 ENV TZ_BUILD_GIT_SHA=${TZ_BUILD_GIT_SHA}
 COPY src/rust/Cargo.toml src/rust/Cargo.lock src/rust/
@@ -69,6 +69,8 @@ COPY --from=builder /opt/truezero/src/rust/target/release/ /opt/truezero/bin/
 COPY --from=builder /opt/venv /opt/venv
 COPY --from=builder /opt/truezero/src/python /opt/truezero/src/python
 COPY docker/entrypoint.sh /usr/local/bin/truezero
+# Every program reads its settings from here (truezero.toml is created from it).
+COPY truezero.example.toml /opt/truezero/truezero.example.toml
 
 RUN chmod 0755 /usr/local/bin/truezero && \
     chown -R truezero:truezero /opt/truezero /opt/libtorch

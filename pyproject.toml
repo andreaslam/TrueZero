@@ -42,7 +42,7 @@ viz = [
     "pillow>=10",
     "tensorboard>=2.16",
 ]
-# W&B telemetry (observe.toml [wandb]); installed by default, training runs without it.
+# W&B telemetry (truezero.toml [wandb]); installed by default, training runs without it.
 telemetry = [
     "wandb>=0.19",
 ]

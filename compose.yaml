@@ -36,7 +36,6 @@ services:
       - server
     environment:
       TZ_SERVER_HOST: server
-      TZ_SERVER_PORT: "38475"
   training:
     extends:
       service: truezero
@@ -46,4 +45,3 @@ services:
       - server
     environment:
       TZ_SERVER_HOST: server
-      TZ_SERVER_PORT: "38475"

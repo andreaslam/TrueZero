@@ -18,24 +18,23 @@ use std::{
 };
 use tch::{Device, Kind, Tensor};
 
+static BATCH_TIMEOUT: std::sync::OnceLock<Duration> = std::sync::OnceLock::new();
+
+/// Fixes the partial-batch timeout for this process (self-play takes it from truezero.toml
+/// `[selfplay] batch_timeout_us`). Must be called before the first executor starts.
+pub fn set_partial_batch_timeout(micros: u64) {
+    let fixed = *BATCH_TIMEOUT.get_or_init(|| Duration::from_micros(micros));
+    assert_eq!(fixed, Duration::from_micros(micros), "batch timeout already fixed");
+}
+
 /// How long the request handler waits for one more request before it flushes a partial batch.
-/// Defaults to 1 µs; `TZ_BATCH_TIMEOUT_US` overrides it, so larger batches can be A/B tested
-/// without a rebuild. Read once per process.
+/// 1 µs unless `set_partial_batch_timeout` fixed it first.
 ///
 /// This is a gap since the last request, not a deadline: when requests arrive faster than the
 /// timeout, the batch fills to `max_batch_size` before it is flushed. `0` switches `executor_main`
 /// to pull batching instead (see [`gather_ready`]).
 pub fn partial_batch_timeout() -> Duration {
-    static TIMEOUT: std::sync::OnceLock<Duration> = std::sync::OnceLock::new();
-    *TIMEOUT.get_or_init(|| {
-        let micros = match std::env::var("TZ_BATCH_TIMEOUT_US") {
-            Ok(value) => value.trim().parse::<u64>().unwrap_or_else(|_| {
-                panic!("TZ_BATCH_TIMEOUT_US must be a whole number of microseconds, got {value:?}")
-            }),
-            Err(_) => 1,
-        };
-        Duration::from_micros(micros)
-    })
+    *BATCH_TIMEOUT.get_or_init(|| Duration::from_micros(1))
 }
 pub const TEMP_NETWORK_PREFIX: &str = "tz_temp_net_";
 
@@ -306,7 +305,7 @@ impl BatchBuffers {
     }
 }
 
-/// Pull batching (`TZ_BATCH_TIMEOUT_US=0`), as in kZero's executor loop: once the executor is free
+/// Pull batching (`batch_timeout_us = 0`), as in kZero's executor loop: once the executor is free
 /// and has received one request, it takes every request already queued, up to `max_batch_size`,
 /// and runs them at once. No request waits for a batch to fill, and the batch is formed when the
 /// executor can run it, not while it is still busy with the previous one.

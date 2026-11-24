@@ -1,23 +1,24 @@
 """Optional Weights & Biases telemetry for the trainer.
 
-Configured by ``<data root>/observe.toml`` (template: ``observe.example.toml``), which is
-NOT part of the run identity: how a run is watched can change mid-run, what it is cannot.
-W&B is on by default (project ``truezero``, your default entity). Online logging needs a
-W&B login (``wandb login`` once, or ``WANDB_API_KEY``); without one the trainer never
-prompts, it logs offline instead (``wandb sync`` uploads later). With ``mode = "off"`` or
-without the ``wandb`` package every call here is a no-op and training is unaffected.
+Configured by the ``[wandb]`` table of truezero.toml. W&B is on by default (project
+``truezero``, your default entity). Online logging needs a W&B login (``wandb login`` once,
+or ``WANDB_API_KEY``); without one the trainer never prompts, it logs offline instead
+(``wandb sync`` uploads later). With ``mode = "off"`` or without the ``wandb`` package every
+call here is a no-op and training is unaffected.
 
 Everything is logged against ``samples_trained`` (the LR schedule's position), never
-wall-clock, so runs compare across hardware and restarts. One W&B run per TrueZero run:
-its id is kept in ``hidden/wandb_run_id.<run_id>`` so a restarted trainer resumes the same W&B run;
-the W&B group is the parent run (or the run itself), so branches sit with their parent.
+wall-clock, so runs compare across hardware and restarts. One W&B run per TrueZero run,
+named after the run (``<name>-<YYYYMMDD-HHMM>``, so reruns never collide) and grouped by
+``[run] name``, so reruns of one experiment sit together. Its id is kept in
+``hidden/wandb_run_id.<run id>`` so a restarted trainer resumes the same W&B run.
 
 Also here, because they feed the logs:
 - ``logger_row``: the lib Logger's values for the current batch (losses, accuracies).
 - ``SelfplayHealth``: per replay file, game length, draw rate, move-limit rate and a
   rolling first-move distribution (a collapse to one opening shows here first).
-- ``LogTailer``: follows the Rust processes' stdout logs (``[Statistics-*]`` and executor
-  timing lines) and forwards averages, so Rust needs no W&B dependency.
+- ``LogTailer``: follows the Rust processes' logs (the launcher writes them to
+  ``<runs_dir>/logs/``) for ``[Statistics-*]`` and executor timing lines and forwards
+  averages, so Rust needs no W&B dependency.
 """
 
 import codecs
@@ -29,52 +30,10 @@ import time
 import uuid
 from collections import Counter, deque
 
-try:
-    import tomllib
-except ModuleNotFoundError:  # Python 3.10
-    tomllib = None
-
 from paths import data_path
 
-OBSERVE_DEFAULTS = {
-    "wandb": {"mode": "online", "project": "truezero", "entity": ""},
-    "tail": {"logs": [], "flush_seconds": 60.0},
-    "ladder": {
-        "enabled": False,
-        "every_accepted_nets": 5,
-        "binary": "",
-        "anchors": [],
-        "games": 100,
-        "nodes": 200,
-        "openings": "hidden/8moves_v3.epd",
-        "tactics": "",
-        "tactics_nodes": 400,
-    },
-}
-
-
-def load_observe_config(path=None):
-    """observe.toml merged over the defaults. Unknown keys are reported, not fatal: this
-    file only controls observation."""
-    path = path or data_path("observe.toml")
-    cfg = {k: dict(v) for k, v in OBSERVE_DEFAULTS.items()}
-    if not os.path.exists(path):
-        return cfg
-    if tomllib is None:
-        print("[telemetry] observe.toml needs Python 3.11+ (tomllib); telemetry is off")
-        return cfg
-    with open(path, "rb") as f:
-        user = tomllib.load(f)
-    for table, values in user.items():
-        if table not in cfg or not isinstance(values, dict):
-            print(f"[telemetry][Warning] {path}: unknown table [{table}] ignored")
-            continue
-        for key, value in values.items():
-            if key not in cfg[table]:
-                print(f"[telemetry][Warning] {path}: unknown key [{table}] {key} ignored")
-                continue
-            cfg[table][key] = value
-    return cfg
+# The launcher's logs the trainer follows, relative to <runs_dir>/logs/.
+TAILED_LOGS = ("server.log", "datagen.log")
 
 
 def wandb_key_available(environ=os.environ, home=None):
@@ -101,19 +60,19 @@ class Telemetry:
 
     def __init__(
         self,
-        observe,
-        run_cfg=None,
+        cfg,
         identity=None,
         wandb_module=None,
         key_check=wandb_key_available,
     ):
+        """`cfg` is the effective truezero.toml (runconfig); only [wandb] is required."""
         self.samples_trained = 0
         self._lock = threading.Lock()
         self._wandb = None
         self._run = None
-        mode = observe["wandb"]["mode"]
+        mode = cfg["wandb"]["mode"]
         if mode == "off":
-            print("[telemetry] W&B off (observe.toml [wandb] mode)")
+            print("[telemetry] W&B off (truezero.toml [wandb] mode)")
             return
         if mode not in ("online", "offline"):
             print(f"[telemetry][Warning] unknown W&B mode {mode!r}; telemetry is off")
@@ -132,17 +91,16 @@ class Telemetry:
                 print("[telemetry][Warning] wandb is not installed; telemetry is off")
                 return
         try:
-            self._run = self._init(wandb_module, observe, run_cfg, identity, mode)
+            self._run = self._init(wandb_module, cfg, identity, mode)
             self._wandb = wandb_module
         except Exception as e:
             print(f"[telemetry][Warning] W&B init failed, telemetry is off: {e!r}")
 
     @staticmethod
-    def _init(wandb, observe, run_cfg, identity, mode):
-        run = (run_cfg or {}).get("run", {})
-        run_id = run.get("run_id", "truezero")
-        # Keyed by run_id, so a branch started from a copy of its parent's hidden/ gets
-        # its own W&B run instead of resuming the parent's.
+    def _init(wandb, cfg, identity, mode):
+        run_id = identity.run_id if identity is not None else "truezero"
+        group = identity.run_name if identity is not None else cfg.get("run", {}).get("name")
+        # Keyed by run_id, so a run folder copied from another gets its own W&B run.
         id_path = data_path(f"hidden/wandb_run_id.{run_id}")
         if os.path.exists(id_path):
             with open(id_path) as f:
@@ -152,7 +110,7 @@ class Telemetry:
             os.makedirs(os.path.dirname(id_path), exist_ok=True)
             with open(id_path, "w") as f:
                 f.write(wandb_id)
-        config = {"run_toml": run_cfg or {}}
+        config = {"truezero_toml": cfg}
         if identity is not None:
             config.update(
                 config_sha256=identity.config_sha256,
@@ -166,13 +124,13 @@ class Telemetry:
         os.environ.setdefault("WANDB_DISABLE_GIT", "true")
         os.environ.setdefault("WANDB_DISABLE_CODE", "true")
         wrun = wandb.init(
-            project=observe["wandb"]["project"],
-            entity=observe["wandb"]["entity"] or None,
+            project=cfg["wandb"]["project"],
+            entity=cfg["wandb"]["entity"] or None,
             mode=mode,
             id=wandb_id,
             resume="allow",
             name=run_id,
-            group=run.get("parent_run_id") or run_id,
+            group=group or run_id,
             config=config,
             dir=data_path("hidden"),
         )
@@ -471,8 +429,8 @@ class LogTailer:
         self._stop.set()
 
 
-def resolve_data_paths(paths):
-    return [p if os.path.isabs(p) else data_path(p) for p in paths]
+def tailed_log_paths(runs_dir):
+    return [os.path.join(str(runs_dir), "logs", name) for name in TAILED_LOGS]
 
 
 def gate_row(test_result, candidate_gen):

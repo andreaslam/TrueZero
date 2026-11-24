@@ -17,7 +17,9 @@ import chess
 
 import ladder
 from eval.make_mate_suite import forces_mate_in_two, mates_in_one
-from telemetry import OBSERVE_DEFAULTS
+import runconfig
+
+LADDER_DEFAULTS = runconfig.config_from_texts(runconfig.EXAMPLE_PATH.read_text(), "")["ladder"]
 
 MATCH = {
     "kind": "match",
@@ -39,7 +41,7 @@ TACTICS = {
 
 
 def cfg(**kw):
-    c = dict(OBSERVE_DEFAULTS["ladder"])
+    c = dict(LADDER_DEFAULTS)
     c.update(kw)
     return c
 
@@ -64,7 +66,7 @@ class LadderTests(unittest.TestCase):
             cfg(anchors=["random", "anchors/tz_18.pt"], binary="lad"), "/n/tz_40.pt"
         )
         self.assertEqual([c[0] for c in cmds], ["random", "anchors/tz_18.pt", "tactics"])
-        self.assertTrue(os.path.isabs(cmds[1][1][5]))  # anchor net resolved to data root
+        self.assertTrue(os.path.isabs(cmds[1][1][5]))  # anchor net resolved to the repository root
         self.assertIn(str(ladder.DEFAULT_SUITE), cmds[2][1])
 
     def test_due_every_n_accepted_and_one_at_a_time(self):

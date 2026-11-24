@@ -20,11 +20,11 @@ use tzrust::{
     data_path, data_path_str,
     dataformat::ZeroEvaluationAbs,
     debug_print,
-    executor::{executor_main, partial_batch_timeout, Packet, TEMP_NETWORK_PREFIX},
+    executor::{executor_main, partial_batch_timeout, set_partial_batch_timeout, Packet, TEMP_NETWORK_PREFIX},
     fileformat::BinaryOutput,
     mcts_trainer::set_virtual_leaves,
     message_types::{DataFileType, Entity, MessageServer, MessageType, Statistics},
-    runconfig::{append_jsonl, sha256_hex, start_run, StartIdentity},
+    runconfig::{append_jsonl, exit_for_restart, sha256_hex, start_client, StartIdentity},
     selfplay::{CollectorMessage, DataGen},
     settings::SearchSettings,
     utils::directory_exists,
@@ -48,21 +48,12 @@ fn net_file_checksum(file_path: &str) -> io::Result<String> {
     Ok(format!("{:x}", checksum.finalize()))
 }
 
-/// Reads a positive integer setting from the environment, falling back to `default`.
-fn env_usize(name: &str, default: usize) -> usize {
-    match env::var(name) {
-        Ok(value) => match value.trim().parse::<usize>() {
-            Ok(n) if n > 0 => n,
-            _ => panic!("{name} must be a positive integer, got {value:?}"),
-        },
-        Err(_) => default,
-    }
-}
-
 fn main() {
-    // run.toml, the run lock and the start log come first: a refused start does nothing else.
-    let (run_cfg, run_identity) = start_run("datagen");
+    // Settings, the current run and the start log come first.
+    let (loaded, run_identity) = start_client("datagen");
+    let run_cfg = loaded.config;
     set_virtual_leaves(run_cfg.selfplay.virtual_leaves);
+    set_partial_batch_timeout(run_cfg.selfplay.batch_timeout_us);
     let search_settings = run_cfg.search_settings();
     let playout_cap = run_cfg.playout_cap();
 
@@ -100,13 +91,11 @@ fn main() {
         std::process::exit(1);
     }));
 
-    let server_host = env::var("TZ_SERVER_HOST").unwrap_or_else(|_| "127.0.0.1".to_string());
-    let server_port = env::var("TZ_SERVER_PORT").unwrap_or_else(|_| "38475".to_string());
-    let server_addr = format!("{server_host}:{server_port}");
+    let server_addr = run_cfg.server_addr();
     let mut stream = loop {
         match TcpStream::connect(&server_addr) {
             Ok(s) => break s,
-            Err(_) => continue,
+            Err(_) => std::thread::sleep(Duration::from_millis(200)),
         }
     };
 
@@ -122,12 +111,9 @@ fn main() {
 
     // Two executors on one GPU let one thread pack and unpack its batch on the CPU while the
     // other's batch runs on the GPU; with one executor the GPU idles during the CPU phases.
-    // Throughput only, so it stays an env var (A/B tests without touching run.toml).
-    let num_executors = env_usize("TZ_NUM_EXECUTORS", 2);
-    let batch_size = 2048;
+    let num_executors = run_cfg.selfplay.num_executors;
+    let batch_size = run_cfg.selfplay.batch_size;
     // Independent of `num_executors`, so changing the executor count changes one thing only.
-    // More generators than it takes to fill the batches only lengthens every game, so it
-    // changes the data and lives in run.toml.
     let num_generators = run_cfg.selfplay.num_generators;
     // Checksum of the net self-play is using, for the provenance log.
     let current_net: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
@@ -153,6 +139,7 @@ fn main() {
         let (executor_ready_send, executor_ready_recv) = flume::unbounded::<bool>();
 
         let commander_net = current_net.clone();
+        let commander_run_id = &run_identity.run_id;
         let _ = s
             .builder()
             .name("commander".to_string())
@@ -164,6 +151,7 @@ fn main() {
                     executor_ready_recv,
                     num_executors,
                     commander_net,
+                    commander_run_id,
                 )
             })
             .unwrap();
@@ -338,7 +326,7 @@ fn collector_main(
             "time": unix_time(),
             "generator_id": id,
             "pid": process::id(),
-            "run_id": run_identity.run.run_id,
+            "run_id": run_identity.run_id,
             "config_sha256": run_identity.config_sha256,
             "git_sha": run_identity.git_sha,
             "git_dirty": run_identity.git_dirty,
@@ -387,7 +375,7 @@ fn collector_main(
                             "event": "file",
                             "time": unix_time(),
                             "generator_id": id,
-                            "run_id": run_identity.run.run_id,
+                            "run_id": run_identity.run_id,
                             "config_sha256": run_identity.config_sha256,
                             "git_sha": run_identity.git_sha,
                             "net_sha256": *current_net.lock().unwrap(),
@@ -468,6 +456,7 @@ fn commander_main(
     executor_ready_receiver: Receiver<bool>,
     num_executors: usize,
     current_net: Arc<Mutex<Option<String>>>,
+    run_id: &str,
 ) {
     let mut curr_net = String::new();
     let mut is_initialised = false;
@@ -487,8 +476,9 @@ fn commander_main(
             fs::create_dir(data_path("nets")).unwrap();
         }
         let mut recv_msg = String::new();
-        if let Err(_) = reader.read_line(&mut recv_msg) {
-            return;
+        match reader.read_line(&mut recv_msg) {
+            Ok(0) | Err(_) => exit_for_restart("the server connection closed"),
+            Ok(_) => {}
         }
         let message = match serde_json::from_str::<MessageServer>(&recv_msg) {
             Ok(message) => message,
@@ -497,6 +487,13 @@ fn commander_main(
                 continue;
             }
         };
+        match &message.purpose {
+            MessageType::RunInfo(id) if id != run_id => {
+                exit_for_restart(&format!("the server is on run {id}, not {run_id}"))
+            }
+            MessageType::ResetRun(id) => exit_for_restart(&format!("new run {id}")),
+            _ => {}
+        }
 
         if is_initialised {
             match message.purpose {
@@ -542,6 +539,7 @@ fn commander_main(
                 MessageType::TBLinkRequest() => {}
                 MessageType::EvaluationRequest(_) => {}
                 MessageType::TestResult(_) => {}
+                MessageType::RunInfo(_) | MessageType::ResetRun(_) => {}
             }
         } else {
             match message.purpose {
@@ -567,6 +565,7 @@ fn commander_main(
                 MessageType::TBLinkRequest() => {}
                 MessageType::EvaluationRequest(_) => {}
                 MessageType::TestResult(_) => {}
+                MessageType::RunInfo(_) | MessageType::ResetRun(_) => {}
             }
         }
 

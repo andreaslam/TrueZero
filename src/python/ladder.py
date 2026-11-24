@@ -1,7 +1,7 @@
 """Fixed anchor ladder: run the Rust `ladder` binary on a net and log the results.
 
 The trainer calls `LadderRunner.maybe_run` whenever a candidate is accepted; every
-`every_accepted_nets` generations (observe.toml [ladder]) it evaluates the new net in a
+`every_accepted_nets` generations (truezero.toml [ladder]) it evaluates the new net in a
 background thread against each anchor and on the tactics suite. Results are logged to W&B
 (ladder/*) at the samples_trained of the net, and appended to hidden/ladder.jsonl.
 
@@ -41,7 +41,13 @@ def anchor_name(spec):
 
 
 def resolve(path):
+    """A net path given on the command line: relative to the current run's folder."""
     return path if os.path.isabs(path) else data_path(path)
+
+
+def resolve_repo(path):
+    """A path from truezero.toml [ladder]: relative to the repository root."""
+    return path if os.path.isabs(path) else str(REPO_ROOT / path)
 
 
 def parse_result(stdout):
@@ -68,13 +74,13 @@ def result_rows(results):
 
 
 def ladder_commands(cfg, net_path):
-    """The ladder invocations for one net, from observe.toml [ladder]."""
-    binary = cfg["binary"] or default_binary()
+    """The ladder invocations for one net, from truezero.toml [ladder]."""
+    binary = cfg.get("binary") or default_binary()
     cmds = []
     for spec in cfg["anchors"]:
         anchor = spec
         if spec != "random" and not spec.startswith("stockfish:"):
-            anchor = resolve(spec)
+            anchor = resolve_repo(spec)
         cmd = [
             binary,
             "match",
@@ -88,9 +94,9 @@ def ladder_commands(cfg, net_path):
             str(cfg["nodes"]),
         ]
         if cfg["openings"]:
-            cmd += ["--openings", resolve(cfg["openings"])]
+            cmd += ["--openings", resolve_repo(cfg["openings"])]
         cmds.append((spec, cmd))
-    suite = resolve(cfg["tactics"]) if cfg["tactics"] else str(DEFAULT_SUITE)
+    suite = resolve_repo(cfg["tactics"]) if cfg["tactics"] else str(DEFAULT_SUITE)
     cmds.append(
         (
             "tactics",
@@ -185,12 +191,12 @@ class LadderRunner:
 
 
 def main(argv=None):
-    from telemetry import load_observe_config
+    import runconfig
 
     p = argparse.ArgumentParser(description="Run the anchor ladder on nets (no W&B).")
     p.add_argument("nets", nargs="+")
     args = p.parse_args(argv)
-    cfg = load_observe_config()["ladder"]
+    cfg = runconfig.load_config().config["ladder"]
     for net in args.nets:
         results = run_ladder(cfg, resolve(net))
         print(json.dumps({"net": net, **result_rows(results)}, indent=2))

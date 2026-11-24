@@ -20,6 +20,7 @@ from lib.loop import LoopBuffer
 
 import client
 import network
+import runconfig
 import telemetry
 
 FIXTURE = os.path.join(
@@ -56,10 +57,19 @@ class FakeWandb:
         pass
 
 
-def online(fake, run_cfg=None):
-    observe = telemetry.load_observe_config("/nonexistent/observe.toml")
-    observe["wandb"]["mode"] = "offline"
-    return telemetry.Telemetry(observe, run_cfg, wandb_module=fake)
+def defaults():
+    """The effective settings with an empty truezero.toml."""
+    return runconfig.config_from_texts(runconfig.EXAMPLE_PATH.read_text(), "")
+
+
+def online(fake, identity=None):
+    cfg = defaults()
+    cfg["wandb"]["mode"] = "offline"
+    return telemetry.Telemetry(cfg, identity, wandb_module=fake)
+
+
+def ident(run_id, name):
+    return runconfig.StartIdentity(run_id, name, "a" * 64, "abc", False, "trainer")
 
 
 class TelemetryTests(unittest.TestCase):
@@ -75,12 +85,12 @@ class TelemetryTests(unittest.TestCase):
         shutil.rmtree(self.dir)
 
     def test_on_by_default(self):
-        cfg = telemetry.load_observe_config("/nonexistent")
+        cfg = defaults()
         self.assertEqual(cfg["wandb"]["mode"], "online")
         self.assertEqual(cfg["wandb"]["project"], "truezero")
 
     def test_off_and_without_wandb_are_no_ops(self):
-        observe = telemetry.load_observe_config("/nonexistent")
+        observe = defaults()
         observe["wandb"]["mode"] = "off"
         t = telemetry.Telemetry(observe)
         self.assertFalse(t.enabled)
@@ -90,7 +100,7 @@ class TelemetryTests(unittest.TestCase):
             self.assertFalse(telemetry.Telemetry(observe, key_check=lambda: True).enabled)
 
     def test_online_without_a_login_falls_back_to_offline_instead_of_prompting(self):
-        observe = telemetry.load_observe_config("/nonexistent")
+        observe = defaults()
         fake = FakeWandb()
         telemetry.Telemetry(observe, wandb_module=fake, key_check=lambda: False)
         self.assertEqual(fake.init_kwargs["mode"], "offline")
@@ -114,22 +124,23 @@ class TelemetryTests(unittest.TestCase):
         t.log({"a": 1.0, "b": float("nan"), "c": None})
         self.assertEqual(fake.rows, [{"a": 1.0, "samples_trained": 4096}])
 
-    def test_run_id_persists_and_group_is_the_parent(self):
-        cfg = {"run": {"run_id": "branch-pcr", "parent_run_id": "base"}}
+    def test_name_is_the_timestamped_run_and_group_is_the_experiment(self):
+        first = ident("truenet-20261124-1503", "truenet")
         fake = FakeWandb()
-        online(fake, cfg)
+        online(fake, first)
         wandb_id = fake.init_kwargs["id"]
-        self.assertEqual(fake.init_kwargs["group"], "base")
+        self.assertEqual(fake.init_kwargs["name"], "truenet-20261124-1503")
+        self.assertEqual(fake.init_kwargs["group"], "truenet")
         self.assertEqual(fake.init_kwargs["resume"], "allow")
-        with open(os.path.join(self.dir, "hidden", "wandb_run_id.branch-pcr")) as f:
+        with open(os.path.join(self.dir, "hidden", "wandb_run_id.truenet-20261124-1503")) as f:
             self.assertEqual(f.read(), wandb_id)
         again = FakeWandb()
-        online(again, cfg)
+        online(again, first)
         self.assertEqual(again.init_kwargs["id"], wandb_id)  # a restart resumes it
-        root = FakeWandb()
-        online(root, {"run": {"run_id": "base", "parent_run_id": ""}})
-        self.assertEqual(root.init_kwargs["group"], "base")
-        self.assertNotEqual(root.init_kwargs["id"], wandb_id)  # never the branch's run
+        rerun = FakeWandb()
+        online(rerun, ident("truenet-20261124-1710", "truenet"))
+        self.assertEqual(rerun.init_kwargs["group"], "truenet")  # grouped with the first
+        self.assertNotEqual(rerun.init_kwargs["id"], wandb_id)  # but its own W&B run
 
     def test_wandb_git_and_code_inference_is_off(self):
         """wandb's own git/code inference crashes on Windows mapped drives (relpath across
@@ -155,14 +166,11 @@ class TelemetryTests(unittest.TestCase):
         fake.log = mock.Mock(side_effect=RuntimeError("network"))
         t.log({"a": 1.0})
 
-    def test_observe_unknown_keys_are_ignored(self):
-        path = os.path.join(self.dir, "observe.toml")
-        with open(path, "w") as f:
-            f.write('[wandb]\nmode = "offline"\nbogus = 1\n[tail]\nlogs = ["a.log"]\n')
-        cfg = telemetry.load_observe_config(path)
-        self.assertEqual(cfg["wandb"]["mode"], "offline")
-        self.assertEqual(cfg["tail"]["logs"], ["a.log"])
-        self.assertNotIn("bogus", cfg["wandb"])
+    def test_tailed_logs_are_the_launchers(self):
+        self.assertEqual(
+            telemetry.tailed_log_paths("/r"),
+            [os.path.join("/r", "logs", "server.log"), os.path.join("/r", "logs", "datagen.log")],
+        )
 
 
 class RustLogTests(unittest.TestCase):

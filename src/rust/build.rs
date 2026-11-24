@@ -27,7 +27,7 @@ fn main() {
         .clone()
         .or_else(|| git(&["rev-parse", "HEAD"]))
         .unwrap_or_else(|| "unknown".into());
-    // Untracked files (run.toml, nets/, ...) do not make the tree dirty.
+    // Untracked files (truezero.toml, runs/, ...) do not make the tree dirty.
     let dirty = match (&injected, git(&["status", "--porcelain", "--untracked-files=no"])) {
         (Some(_), _) => false,
         (None, Some(s)) => !s.is_empty(),

@@ -1,4 +1,3 @@
-import argparse
 import hashlib
 import io
 import json
@@ -7,6 +6,7 @@ import queue
 import random
 import re
 import socket
+import sys
 import threading
 import time
 import warnings
@@ -25,18 +25,18 @@ from lib.games import Game
 from lib.logger import Logger
 from lib.loop import LoopBuffer
 from lib.train import ScalarTarget, TrainSettings
+import runconfig
 from paths import data_dir, data_path
 from ladder import LadderRunner
-from runconfig import record_received_file, start_run
+from runconfig import RESTART_EXIT_CODE, record_received_file
 from telemetry import (
     LogTailer,
     SelfplayHealth,
     Telemetry,
     buffer_row,
     gate_row,
-    load_observe_config,
     logger_row,
-    resolve_data_paths,
+    tailed_log_paths,
 )
 from torch import optim
 
@@ -193,11 +193,8 @@ def set_policy_weight(train_settings, batch):
     return fraction
 
 
-HOST = os.environ.get("TZ_SERVER_HOST", "127.0.0.1")
-PORT = int(os.environ.get("TZ_SERVER_PORT", "38475"))
-
-# The training hyperparameters below are the defaults (equal to run.example.toml);
-# main() replaces them with the run's run.toml through apply_run_config.
+# The training hyperparameters below are the defaults (equal to truezero.example.toml);
+# main() replaces them with truezero.toml's through apply_run_config.
 BUFFER_SIZE = 1500000
 BATCH_SIZE = 2048
 
@@ -235,13 +232,21 @@ LOSS_WEIGHTS = {
 
 assert BATCH_SIZE > 0 and (BATCH_SIZE & (BATCH_SIZE - 1)) == 0
 
-data_dir("hidden")
+def bind_run_paths():
+    """Point the trainer's files at the data root (the current run's folder). main() calls
+    this once runconfig.start has fixed the root."""
+    global DATAFILE_PATH, TRAINING_LOG_PATH, LOG_NPZ_PATH, TRAINER_STATE_PATH
+    DATAFILE_PATH = data_path("hidden/datafile.txt")
+    TRAINING_LOG_PATH = data_path("hidden/traininglog.txt")
+    LOG_NPZ_PATH = data_path("log.npz")
+    TRAINER_STATE_PATH = data_path("hidden/trainer_state.pt")
 
-DATAFILE_PATH = data_path("hidden/datafile.txt")
-TRAINING_LOG_PATH = data_path("hidden/traininglog.txt")
-LOG_NPZ_PATH = data_path("log.npz")
-TRAINER_STATE_PATH = data_path("hidden/trainer_state.pt")
+
+bind_run_paths()
 TRAINER_STATE_VERSION = 1
+
+# The network a fresh run starts from (truezero.toml [net]); main() sets it.
+NET_CONFIG = {"arch": "TrueNet", "blocks": 10, "channels": 128}
 
 LAST_SENT_NET_CHECKSUM = None
 
@@ -291,7 +296,7 @@ def create_optimizer(model):
 # optimiser. A fresh optimiser starts the schedule at zero, so it warms up
 # again rather than taking full-rate steps from empty Adam moments.
 #
-# Set in run.toml [trainer]:
+# Set in truezero.toml [trainer]:
 #   lr_schedule        "samples:lr,..." piecewise-constant points, starting
 #                      at 0; counts take K/M/B suffixes, e.g. "0:1e-3,50M:5e-4"
 #   lr_warmup_samples  warm-up length in samples (0 disables warm-up)
@@ -345,7 +350,7 @@ class LrSchedule:
 
     @classmethod
     def from_config(cls):
-        """A schedule at sample 0 from LR_SCHEDULE and LR_WARMUP_SAMPLES (run.toml)."""
+        """A schedule at sample 0 from LR_SCHEDULE and LR_WARMUP_SAMPLES (truezero.toml)."""
         return cls(
             parse_lr_schedule(LR_SCHEDULE),
             parse_sample_count(LR_WARMUP_SAMPLES),
@@ -514,7 +519,7 @@ def load_trainer_state(model, accepted_gen, device, path=None):
 
 
 def apply_run_config(cfg):
-    """Set the training hyperparameters from a validated run.toml."""
+    """Set the training hyperparameters from the effective truezero.toml."""
     global BUFFER_SIZE, BATCH_SIZE, MIN_BUFFER_TO_TRAIN, EPOCHS_PER_GEN
     global RECENT_BATCH_FRACTION, MIN_TRAINING_STEPS, STARTUP_TRAINING_STEPS
     global TEST_FRACTION, LR_SCHEDULE, LR_WARMUP_SAMPLES, WEIGHT_DECAY, POLICY_WEIGHT
@@ -543,19 +548,22 @@ def seed_everything(seed):
     torch.manual_seed(seed)
 
 
-def parse_args(argv=None):
-    parser = argparse.ArgumentParser(description="TrueZero trainer")
-    parser.add_argument(
-        "--allow-config-change",
-        action="store_true",
-        help="start although run.toml differs from the one the run was locked with",
-    )
-    parser.add_argument(
-        "--allow-code-change",
-        action="store_true",
-        help="start although the code is not at the run's pinned commit",
-    )
-    return parser.parse_args(argv)
+def run_change(raw_data, run_id):
+    """Why this trainer must restart (the server started a new run), or None."""
+    purpose = raw_data.get("purpose") if isinstance(raw_data, dict) else None
+    if not isinstance(purpose, dict):
+        return None
+    if "ResetRun" in purpose:
+        return f"new run {purpose['ResetRun']}"
+    if "RunInfo" in purpose and purpose["RunInfo"] != run_id:
+        return f"the server is on run {purpose['RunInfo']}, not {run_id}"
+    return None
+
+
+def new_net(net_cfg):
+    """A fresh network from truezero.toml [net]."""
+    cls = network.TrueNet if net_cfg["arch"] == "TrueNet" else network.TrueNetXS
+    return cls(num_resBlocks=net_cfg["blocks"], num_hidden=net_cfg["channels"])
 
 
 def receiver_loop(server, message_queue, receiver_stop_event):
@@ -601,24 +609,21 @@ def get_message(message_queue, timeout=0.05):
 
 
 def main():
-    args = parse_args()
-    # run.toml, the run lock and the start log come first: a refused start does nothing else.
-    run_cfg, run_identity = start_run(
-        "trainer",
-        allow_config_change=args.allow_config_change,
-        allow_code_change=args.allow_code_change,
-    )
+    # Settings, the current run (created by the server) and the start log come first.
+    run_cfg, run_identity, _run_dir = runconfig.start("trainer")
+    bind_run_paths()
+    data_dir("hidden")
     apply_run_config(run_cfg)
-    global RUN_IDENTITY, TELEMETRY
+    global RUN_IDENTITY, TELEMETRY, NET_CONFIG
     RUN_IDENTITY = run_identity
-    observe = load_observe_config()
-    TELEMETRY = Telemetry(observe, run_cfg, run_identity)
+    NET_CONFIG = run_cfg["net"]
+    TELEMETRY = Telemetry(run_cfg, run_identity)
     LogTailer(
         TELEMETRY,
-        resolve_data_paths(observe["tail"]["logs"]),
-        flush_seconds=float(observe["tail"]["flush_seconds"]),
+        tailed_log_paths(runconfig.runs_dir(run_cfg)),
+        flush_seconds=float(run_cfg["wandb"]["flush_seconds"]),
     ).start()
-    ladder = LadderRunner(observe["ladder"], TELEMETRY)
+    ladder = LadderRunner(run_cfg["ladder"], TELEMETRY)
     seed_everything(run_cfg["run"]["seed"])
 
     game = Game.find("chess")
@@ -666,7 +671,9 @@ def main():
 
     print(f"starting generation: {starting_gen}")
 
-    server = Server(HOST, PORT)
+    # TZ_SERVER_HOST: Docker, where the server is another container.
+    host = os.environ.get("TZ_SERVER_HOST") or run_cfg["server"]["host"]
+    server = Server(host, run_cfg["server"]["port"])
     server.connect()
 
     # Verification happens synchronously before the receiver thread starts.
@@ -783,6 +790,18 @@ def main():
                 continue
 
             received_data_string = str(raw_data)
+
+            # -------------------------------------------------------
+            # New run (`server reset`): restart under the launcher.
+            # -------------------------------------------------------
+
+            if (why := run_change(raw_data, run_identity.run_id)) is not None:
+                print(f"[run] {why}; {runconfig.RESTART_SENTINEL} the trainer.")
+                TELEMETRY.finish()
+                sys.stdout.flush()
+                # Not server.close(): closing the socket file while the receiver thread is
+                # blocked reading it deadlocks on the file's lock. Exiting closes it.
+                os._exit(RESTART_EXIT_CODE)
 
             # -------------------------------------------------------
             # Network request.
@@ -1801,7 +1820,8 @@ def check_net_exists(
 
     if not os.listdir(data_dir("nets")) or not training_nets:
         with torch.no_grad():
-            net = torch.jit.script(network.TrueNetXS(num_hidden=64).to(device)).eval()
+            net = torch.jit.script(new_net(NET_CONFIG).to(device)).eval()
+            print(f"[Training] New run: created tz_0 from {NET_CONFIG}")
 
             torch.jit.save(
                 net,

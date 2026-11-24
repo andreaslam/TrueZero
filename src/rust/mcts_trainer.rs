@@ -135,7 +135,7 @@ pub struct Tree {
 
 static VIRTUAL_LEAVES: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
 
-/// Fixes the leaves per step for this process (self-play takes it from run.toml). Must be
+/// Fixes the leaves per step for this process (self-play takes it from truezero.toml). Must be
 /// called before the first `Tree::new`; panics if the value was already fixed differently.
 pub fn set_virtual_leaves(k: usize) {
     assert!(k >= 1, "virtual leaves must be >= 1, got {k}");
