@@ -11,8 +11,6 @@ use std::{
     num::NonZeroUsize,
     panic,
     path::Path,
-    process,
-    sync::{Arc, Mutex},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 use tzrust::{
@@ -20,13 +18,12 @@ use tzrust::{
     data_path, data_path_str,
     dataformat::ZeroEvaluationAbs,
     debug_print,
-    executor::{executor_main, partial_batch_timeout, set_partial_batch_timeout, Packet, TEMP_NETWORK_PREFIX},
+    executor::{executor_main, Packet, TEMP_NETWORK_PREFIX},
     fileformat::BinaryOutput,
-    mcts_trainer::set_virtual_leaves,
+    mcts_trainer::{EvalMode, TypeRequest::TrainerSearch},
     message_types::{DataFileType, Entity, MessageServer, MessageType, Statistics},
-    runconfig::{append_jsonl, exit_for_restart, sha256_hex, start_client, StartIdentity},
     selfplay::{CollectorMessage, DataGen},
-    settings::SearchSettings,
+    settings::{CPUCTSettings, FPUSettings, MovesLeftSettings, PSTSettings, SearchSettings},
     utils::directory_exists,
 };
 
@@ -48,15 +45,11 @@ fn net_file_checksum(file_path: &str) -> io::Result<String> {
     Ok(format!("{:x}", checksum.finalize()))
 }
 
-fn main() {
-    // Settings, the current run and the start log come first.
-    let (loaded, run_identity) = start_client("datagen");
-    let run_cfg = loaded.config;
-    set_virtual_leaves(run_cfg.selfplay.virtual_leaves);
-    set_partial_batch_timeout(run_cfg.selfplay.batch_timeout_us);
-    let search_settings = run_cfg.search_settings();
-    let playout_cap = run_cfg.playout_cap();
+/// Training server address.
+const SERVER_HOST: &str = "127.0.0.1";
+const SERVER_PORT: u16 = 38475;
 
+fn main() {
     tch::set_num_threads(1);
     tch::set_num_interop_threads(1);
     let logical_cpus = num_cpus::get();
@@ -91,11 +84,11 @@ fn main() {
         std::process::exit(1);
     }));
 
-    let server_addr = run_cfg.server_addr();
+    let server_addr = format!("{SERVER_HOST}:{SERVER_PORT}");
     let mut stream = loop {
         match TcpStream::connect(&server_addr) {
             Ok(s) => break s,
-            Err(_) => std::thread::sleep(Duration::from_millis(200)),
+            Err(_) => continue,
         }
     };
 
@@ -109,19 +102,10 @@ fn main() {
         .expect("Failed to send data");
     println!("Connected to server!");
 
-    // Two executors on one GPU let one thread pack and unpack its batch on the CPU while the
-    // other's batch runs on the GPU; with one executor the GPU idles during the CPU phases.
-    let num_executors = run_cfg.selfplay.num_executors;
-    let batch_size = run_cfg.selfplay.batch_size;
-    // Independent of `num_executors`, so changing the executor count changes one thing only.
-    let num_generators = run_cfg.selfplay.num_generators;
-    // Checksum of the net self-play is using, for the provenance log.
-    let current_net: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
-    println!(
-        "[Datagen] {num_executors} executor(s), {num_generators} generators, \
-         batch size {batch_size}, partial-batch timeout {:?}",
-        partial_batch_timeout()
-    );
+    let num_executors = 1;
+    // num_executors = max(min(tch::Cuda::device_count() as usize, num_executors), 1);
+    let batch_size = 2048;
+    let num_generators = num_executors * batch_size * 2;
 
     let (game_sender, game_receiver) = flume::bounded::<CollectorMessage>(num_generators);
     thread::scope(|s| {
@@ -138,8 +122,6 @@ fn main() {
         let (id_send, id_recv) = flume::bounded::<usize>(1);
         let (executor_ready_send, executor_ready_recv) = flume::unbounded::<bool>();
 
-        let commander_net = current_net.clone();
-        let commander_run_id = &run_identity.run_id;
         let _ = s
             .builder()
             .name("commander".to_string())
@@ -150,8 +132,6 @@ fn main() {
                     id_send,
                     executor_ready_recv,
                     num_executors,
-                    commander_net,
-                    commander_run_id,
                 )
             })
             .unwrap();
@@ -179,23 +159,12 @@ fn main() {
                 .unwrap();
         }
 
-        println!("[Datagen] playout cap randomisation: {playout_cap:?}");
         for n in 0..num_generators {
             let sender_clone = game_sender.clone();
-            let selfplay_master = DataGen {
-                iterations: 1,
-                playout_cap,
-            };
+            let selfplay_master = DataGen { iterations: 1 };
             let tensor_exe_send_clone = tensor_exe_send.clone();
             let fut_generator = async move {
-                generator_main(
-                    sender_clone,
-                    selfplay_master,
-                    tensor_exe_send_clone,
-                    n,
-                    search_settings,
-                )
-                .await;
+                generator_main(sender_clone, selfplay_master, tensor_exe_send_clone, n).await;
             };
             pool.spawn_ok(fut_generator);
         }
@@ -208,8 +177,6 @@ fn main() {
                     &game_receiver,
                     &mut stream.try_clone().expect("clone failed"),
                     id_recv,
-                    &run_identity,
-                    &current_net,
                 )
             })
             .unwrap();
@@ -222,8 +189,35 @@ async fn generator_main(
     datagen: DataGen,
     tensor_exe_send: Sender<Packet>,
     id: usize,
-    settings: SearchSettings,
 ) {
+    let m_settings = MovesLeftSettings {
+        moves_left_weight: 0.05,
+        moves_left_clip: 20.0,
+        moves_left_sharpness: 0.5,
+    };
+
+    let settings: SearchSettings = SearchSettings {
+        fpu: FPUSettings {
+            root_fpu: 1.0,
+            children_fpu: 0.5,
+        },
+        wdl: EvalMode::Wdl,
+        moves_left: Some(m_settings),
+        c_puct: CPUCTSettings {
+            root_c_puct: 2.0,
+            children_c_puct: 2.0,
+        },
+        max_nodes: Some(1600),
+        alpha: 0.03,
+        eps: 0.25,
+        search_type: TrainerSearch(None),
+        pst: PSTSettings {
+            root_pst: 1.5,
+            children_pst: 1.5,
+        },
+        batch_size: 1,
+    };
+
     let nps_sender = sender_collector.clone();
 
     // implement caching
@@ -284,26 +278,10 @@ fn serialise_file_to_bytes(file_path: &str) -> io::Result<Vec<u8>> {
     Ok(buffer)
 }
 
-/// Self-play provenance, a sidecar to the KZero-format files (which are not changed): who
-/// produced each replay file. The trainer records the SHA-256 of every .bin it receives, so
-/// a file joins back to its generator, run, config, commit and net on `bin_sha256`.
-fn provenance_path() -> std::path::PathBuf {
-    data_path("hidden/provenance/datagen.jsonl")
-}
-
-fn unix_time() -> f64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs_f64())
-        .unwrap_or(0.0)
-}
-
 fn collector_main(
     receiver: &Receiver<CollectorMessage>,
     server_handle: &mut TcpStream,
     id_recv: Receiver<usize>,
-    run_identity: &StartIdentity,
-    current_net: &Mutex<Option<String>>,
 ) {
     let _thread_name = std::thread::current()
         .name()
@@ -319,19 +297,6 @@ fn collector_main(
         println!("created {}", folder_name.display());
     }
     let id = id_recv.recv().unwrap();
-    append_jsonl(
-        &provenance_path(),
-        &serde_json::json!({
-            "event": "start",
-            "time": unix_time(),
-            "generator_id": id,
-            "pid": process::id(),
-            "run_id": run_identity.run_id,
-            "config_sha256": run_identity.config_sha256,
-            "git_sha": run_identity.git_sha,
-            "git_dirty": run_identity.git_dirty,
-        }),
-    );
     let (mut path, mut bin_output) = new_game_file(id);
     let mut nps_start_time = Instant::now();
     let mut nps_vec: Vec<usize> = Vec::new();
@@ -369,21 +334,6 @@ fn collector_main(
                         file_data[1].clone(),
                         file_data[2].clone(),
                     );
-                    append_jsonl(
-                        &provenance_path(),
-                        &serde_json::json!({
-                            "event": "file",
-                            "time": unix_time(),
-                            "generator_id": id,
-                            "run_id": run_identity.run_id,
-                            "config_sha256": run_identity.config_sha256,
-                            "git_sha": run_identity.git_sha,
-                            "net_sha256": *current_net.lock().unwrap(),
-                            "bin_sha256": sha256_hex(&bin_file),
-                            "games": bin_output.game_count(),
-                            "positions": bin_output.position_count(),
-                        }),
-                    );
 
                     let message = MessageServer {
                         purpose: MessageType::JobSendData(vec![
@@ -405,12 +355,8 @@ fn collector_main(
                 }
             }
             CollectorMessage::GeneratorStatistics(nps) => {
-                // Report a rate: the visits counted in this window divided by its real length.
-                nps_vec.push(nps);
-                let elapsed = nps_start_time.elapsed();
-                if elapsed >= Duration::from_secs(1) {
-                    let nps =
-                        (nps_vec.iter().sum::<usize>() as f64 / elapsed.as_secs_f64()) as usize;
+                if nps_start_time.elapsed() >= Duration::from_secs(1) {
+                    let nps: usize = nps_vec.iter().sum();
                     nps_start_time = Instant::now();
                     nps_vec = Vec::new();
                     let message = MessageServer {
@@ -420,15 +366,13 @@ fn collector_main(
                         serde_json::to_string(&message).expect("serialisation failed");
                     serialised += "\n";
                     server_handle.write_all(serialised.as_bytes()).unwrap();
+                } else {
+                    nps_vec.push(nps);
                 }
             }
             CollectorMessage::ExecutorStatistics(evals_per_sec) => {
-                // Same as above: evaluations in this window divided by its real length.
-                evals_vec.push(evals_per_sec);
-                let elapsed = evals_start_time.elapsed();
-                if elapsed >= Duration::from_secs(1) {
-                    let evals_per_second =
-                        (evals_vec.iter().sum::<usize>() as f64 / elapsed.as_secs_f64()) as usize;
+                if evals_start_time.elapsed() >= Duration::from_secs(1) {
+                    let evals_per_second: usize = evals_vec.iter().sum();
                     evals_start_time = Instant::now();
                     evals_vec = Vec::new();
                     let message = MessageServer {
@@ -440,6 +384,8 @@ fn collector_main(
                         serde_json::to_string(&message).expect("serialisation failed");
                     serialised += "\n";
                     server_handle.write_all(serialised.as_bytes()).unwrap();
+                } else {
+                    evals_vec.push(evals_per_sec);
                 }
             }
             CollectorMessage::GameResult(_) => {}
@@ -455,8 +401,6 @@ fn commander_main(
     id_sender: Sender<usize>,
     executor_ready_receiver: Receiver<bool>,
     num_executors: usize,
-    current_net: Arc<Mutex<Option<String>>>,
-    run_id: &str,
 ) {
     let mut curr_net = String::new();
     let mut is_initialised = false;
@@ -476,9 +420,8 @@ fn commander_main(
             fs::create_dir(data_path("nets")).unwrap();
         }
         let mut recv_msg = String::new();
-        match reader.read_line(&mut recv_msg) {
-            Ok(0) | Err(_) => exit_for_restart("the server connection closed"),
-            Ok(_) => {}
+        if let Err(_) = reader.read_line(&mut recv_msg) {
+            return;
         }
         let message = match serde_json::from_str::<MessageServer>(&recv_msg) {
             Ok(message) => message,
@@ -487,13 +430,6 @@ fn commander_main(
                 continue;
             }
         };
-        match &message.purpose {
-            MessageType::RunInfo(id) if id != run_id => {
-                exit_for_restart(&format!("the server is on run {id}, not {run_id}"))
-            }
-            MessageType::ResetRun(id) => exit_for_restart(&format!("new run {id}")),
-            _ => {}
-        }
 
         if is_initialised {
             match message.purpose {
@@ -539,7 +475,6 @@ fn commander_main(
                 MessageType::TBLinkRequest() => {}
                 MessageType::EvaluationRequest(_) => {}
                 MessageType::TestResult(_) => {}
-                MessageType::RunInfo(_) | MessageType::ResetRun(_) => {}
             }
         } else {
             match message.purpose {
@@ -565,7 +500,6 @@ fn commander_main(
                 MessageType::TBLinkRequest() => {}
                 MessageType::EvaluationRequest(_) => {}
                 MessageType::TestResult(_) => {}
-                MessageType::RunInfo(_) | MessageType::ResetRun(_) => {}
             }
         }
 
@@ -598,7 +532,6 @@ fn commander_main(
             }
 
             curr_net = net_path.clone();
-            *current_net.lock().unwrap() = curr_net_checksum.clone();
         }
         if net_path.is_empty() {
             // actively request for net path

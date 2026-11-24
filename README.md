@@ -65,8 +65,6 @@ uv sync
 
 This creates `.venv/` with Python 3.12 (from `.python-version`) and every default dependency group: `torch`, `gui` (training plots, GUI), `viz` (visualisation, TensorBoard) and `tools`. Run scripts with `uv run`, e.g. `uv run python client.py`, or activate `.venv` first. To install only the libtorch version the Rust `tch` crate is built against (what the Docker image uses), run `uv sync --no-default-groups --group tch`.
 
-If the repository is on a network drive (e.g. `U:\` mapped to `\\server\home`), keep the venv on a local disk: DLLs such as numpy's often fail to load from a share. In PowerShell, `$env:UV_PROJECT_ENVIRONMENT = "C:\venvs\truezero"` before `uv sync` and `uv run` (set it once for good with `[Environment]::SetEnvironmentVariable("UV_PROJECT_ENVIRONMENT", "C:\venvs\truezero", "User")`). The launcher does this for the trainer if `truezero.toml` says `[launcher] venv = 'C:\venvs\truezero'`.
-
 ## Setting environment variables
 
 Set the following environment variables to configure `tch-rs` before running anything (or `source script.sh`).
@@ -86,39 +84,37 @@ $env:PATH = "$PYTORCH_PATH\lib;$env:PATH"
 
 ## Running Data Generation and Training
 
-One command, from the repository root:
+Before data generation, ensure that the loaded copy of the Repository is up-to-date.
 
 ```
-cargo run --release --bin truezero              # start, or resume the current run
-cargo run --release --bin truezero -- reset     # start a fresh run
+git pull
 ```
 
-The launcher builds the other binaries, downloads the gate's opening book if it is missing
-(from [official-stockfish/books](https://github.com/official-stockfish/books)), then starts
-the server, the trainer (`client.py`), self-play (`main`) and the gate (`trainenginetest`).
-Their output appears in one window with a `[server]`/`[trainer]`/`[datagen]`/`[gate]`
-prefix and is also appended to `runs/logs/<name>.log`. A program that crashes is restarted
-(after 5 crashes in 10 minutes the launcher stops everything). Ctrl+C stops everything.
+To run data generation, simply run the python training client `client.py`, the `main` binary and the `server` binary as follows. Open a new terminal window for each.
 
-Settings live in one file, `truezero.toml` (see the next section). Nothing else needs
-setting up: no environment variables, no files to copy, no `tz_0` to create by hand.
-
-To reset while everything is running (from another terminal):
+Python side (from `src/python`):
 
 ```
-cargo run --release --bin server -- reset
+cd src/python
+uv run python client.py
 ```
 
-The server starts a new run and tells the trainer, self-play and the gate to restart on it;
-the launcher restarts them. The programs can still be started by hand, one terminal each,
-server first: `cargo run --release --bin server`, `uv run python client.py` (from
-`src/python`), `cargo run --release --bin main`, `cargo run --release --bin trainenginetest`.
+Rust side (from `src/rust`):
+
+```
+cd src/rust
+cargo run --bin main --release
+```
+
+```
+cd src/rust
+cargo run --bin server --release
+```
 
 ### Lichess bot
 
 `lichess` plays on Lichess with the networks supplied by the training server.
-It connects to the server like `main` (a RustDataGen, honouring
-`TZ_SERVER_HOST`/`TZ_SERVER_PORT`) and evaluates positions with the same
+It connects to the server like `main` (a RustDataGen) and evaluates positions with the same
 batched executors. Start `server` (and `client.py`, which provides the
 networks) as above, export `LICHESS_API_KEY`, then run:
 
@@ -134,79 +130,18 @@ networks are loaded as the server sends them.
 
 **Training on Lichess games is off by default.** The bot then only plays: it
 searches without exploration noise and sends no games to the server. To use
-its games as training data, set:
-
-```powershell
-$env:TZ_LICHESS_COLLECT_DATA = "1"
-```
+its games as training data, set `COLLECT_DATA = true` in
+`src/rust/src/bin/lichess.rs`.
 
 With collection on, the positions where TrueZero was to move are written with
 the game's Lichess result (including resignations, timeouts and agreed draws)
 and sent to the server every 100 games, like self-play data. Aborted games are
 not recorded.
 
-Other settings:
+Other settings (`NUM_EXECUTORS`, `BATCH_SIZE`, `MAX_CONCURRENT_GAMES`, server
+address) are constants at the top of `lichess.rs`.
 
-| Variable | Default | Purpose |
-| --- | --- | --- |
-| `TZ_NUM_EXECUTORS` | `2` | Executor threads |
-| `TZ_BATCH_SIZE` | `1024` | Executor batch size |
-| `TZ_TENSOR_QUEUE_CAPACITY` | executors × batch size | Evaluation queue length |
-| `TZ_MAX_CONCURRENT_GAMES` | `4` | Games played at once; extra challenges are declined |
-
-## Settings and runs: truezero.toml
-
-**One file for everything.** `truezero.example.toml` (committed) lists every setting with
-its default and what it does: the network for a fresh run (`[net]`), self-play and search
-(`[selfplay]`), the gate's book, the trainer, W&B, the anchor ladder, the server port and
-how the launcher starts Python (`[launcher]`). Your settings go in `truezero.toml` (not
-committed; created from the example the first time anything starts). It only needs the keys
-you change; the rest come from the example. A misspelt key or a wrongly typed value stops
-the start with a message saying which. Every program (server, launcher, `main`,
-`trainenginetest`, `client.py`, `ladder.py`) reads the same pair of files.
-
-**One folder per run.** A run lives in `runs/<name>-<YYYYMMDD-HHMM>/` (UTC; `<name>` is
-`[run] name`) with its `nets/`, `games/`, `hidden/` and `python_client_games/`. The server
-creates it (on its first start, or on `reset`) and writes its name to `runs/current_run`,
-which every other program follows. Starting again without `reset` resumes the current run;
-`reset` never deletes or moves anything, so earlier runs stay exactly as they were. The
-run's first net, `nets/tz_0.pt`, is created from `[net]`.
-
-**Provenance without the paperwork.** Each run folder keeps `run.json` (git commit, whether
-the tree was dirty, SHA-256 of truezero.toml) and `config.toml` (a copy of truezero.toml when
-the run started). Every program start is logged in `hidden/run_log.jsonl`; if truezero.toml
-was edited since the run started, a copy of the new file is kept in
-`hidden/config_history/` and a warning is printed, but nothing is refused.
-`hidden/provenance/datagen.jsonl` (self-play: generator, run, config, commit, net for each
-replay file) and `hidden/provenance/trainer.jsonl` (each received file) join on
-`bin_sha256`.
-
-**W&B.** On by default (`[wandb] mode = "online"`, project `truezero`). The W&B run name is
-the run folder's name, so a rerun never collides with an earlier one and never needs
-renaming; runs with the same `[run] name` are grouped. Log in once with
-`uv run wandb login` (on a network drive, where that fails with "path is on mount 'U:',
-start on mount '\\server…'", run `$env:WANDB_DISABLE_GIT = "true"` first; the trainer sets
-this itself). Without a login the trainer logs offline rather than prompting
-(`wandb sync runs/<run>/hidden/wandb/offline-run-*` uploads later); `mode = "off"` disables
-it. Metrics are plotted against samples trained: losses, policy accuracy (full searches
-only), policy entropy, LR, buffer age, gate results, per-file game length, draw rate, the
-first-move distribution, and nodes/s, evals/s and executor timings from the launcher's
-logs.
-
-**Anchor ladder** (`[ladder]`, off by default): every N accepted nets the trainer runs
-`ladder` in the background: fixed-node matches against frozen anchors (a copied net such
-as `anchors/tz_18.pt` relative to the repository root, `random`, or
-`stockfish:<path>:<skill>`) plus the bundled mate-in-1/2 suite. Results go to W&B
-(`ladder/*`) and `hidden/ladder.jsonl`. `uv run python src/python/ladder.py nets/tz_40.pt`
-evaluates nets of the current run by hand.
-
-**Environment variables.** None are needed. The old ones that set hyperparameters or ports
-(`TZ_NUM_GENERATORS`, `TZ_VIRTUAL_LEAVES`, `TZ_PCR_*`, `TZ_LR_*`, `TZ_NUM_EXECUTORS`,
-`TZ_BATCH_TIMEOUT_US`, `TZ_SERVER_PORT`) are ignored with a warning (`Remove-Item
-Env:TZ_PCR_FULL_PROB` silences it). Rare overrides that remain: `TZ_DEVICE`
-(`cpu`/`cuda`/`mps` for the Rust programs), `TZ_SERVER_HOST` (Docker, where the server is
-another container) and `TZ_DATA_ROOT` (pins one data folder instead of `runs/`, as Docker
-does; `reset` is then refused).
+All data (`nets/`, `games/`, `hidden/`, `python_client_games/`, `log.npz`) is read from and written to the project root automatically, regardless of where you launch each process.
 
 ## Running the Engine in UCI
 
@@ -217,7 +152,7 @@ cd src/rust
 cargo run --bin ucimain --release -- nets/tz_42.pt
 ```
 
-The optional argument is the network file, resolved relative to the current run's folder (`runs/<run>/`, or `TZ_DATA_ROOT` if set); an absolute path also works. Without it, the engine uses `TZ_MODEL_PATH` if set, otherwise `nets/tz_0.pt`. The compiled binaries (in `src/rust/target/release/`) can also be launched directly from any directory.
+The optional argument is the network file, resolved relative to the project root; an absolute path also works. Without it, the engine uses `nets/tz_0.pt`. The compiled binaries (in `src/rust/target/release/`) can also be launched directly from any directory.
 
 ## Internal Engine testing (non-UCI compliant)
 - `getdecode.rs` - used for obtaining the encoded NN inputs.

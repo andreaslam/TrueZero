@@ -3,7 +3,7 @@ use crate::{
     cache::CacheEntryKey,
     dataformat::{ZeroEvaluationAbs, ZeroValuesAbs, ZeroValuesPov},
     debug_print,
-    decoder::{board_input, extract_policy, process_board_output},
+    decoder::{convert_board, extract_policy, process_board_output},
     dirichlet::StableDirichlet,
     executor::{Packet, ReturnMessage},
     mvs::get_contents,
@@ -54,20 +54,22 @@ pub struct Net {
     pub device: Device,
 }
 
+/// Device for every network: "auto" (CUDA, then MPS, then CPU), "cpu", "cuda" or "mps".
+pub const DEVICE: &str = "auto";
+
 fn requested_device(id: Option<usize>) -> Device {
     maybe_init_cuda();
-    let requested = std::env::var("TZ_DEVICE").unwrap_or_else(|_| "auto".to_string());
-    match requested.to_ascii_lowercase().as_str() {
+    match DEVICE {
         "cpu" => Device::Cpu,
         "cuda" => {
             if !has_cuda() {
-                panic!("TZ_DEVICE=cuda was requested, but CUDA is unavailable");
+                panic!("DEVICE = \"cuda\" was requested, but CUDA is unavailable");
             }
             Device::Cuda(id.unwrap_or(0))
         }
         "mps" => {
             if !has_mps() {
-                panic!("TZ_DEVICE=mps was requested, but MPS is unavailable");
+                panic!("DEVICE = \"mps\" was requested, but MPS is unavailable");
             }
             Device::Mps
         }
@@ -80,7 +82,7 @@ fn requested_device(id: Option<usize>) -> Device {
                 Device::Cpu
             }
         }
-        value => panic!("Unsupported TZ_DEVICE={value}; use auto, cpu, cuda, or mps"),
+        value => panic!("Unsupported DEVICE = {value:?}; use auto, cpu, cuda, or mps"),
     }
 }
 
@@ -129,32 +131,14 @@ pub struct Tree {
     pub pv: String,
     pub root_net_policy: Option<Vec<f32>>,
     /// leaves gathered per `step` (virtual-loss leaf batching); 1 is plain sequential MCTS.
-    /// Set from `TZ_VIRTUAL_LEAVES` by `Tree::new`.
+    /// Set from `VIRTUAL_LEAVES` by `Tree::new`.
     pub virtual_leaves: usize,
 }
 
-static VIRTUAL_LEAVES: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-
-/// Fixes the leaves per step for this process (self-play takes it from truezero.toml). Must be
-/// called before the first `Tree::new`; panics if the value was already fixed differently.
-pub fn set_virtual_leaves(k: usize) {
-    assert!(k >= 1, "virtual leaves must be >= 1, got {k}");
-    let fixed = *VIRTUAL_LEAVES.get_or_init(|| k);
-    assert_eq!(fixed, k, "virtual leaves already fixed at {fixed}");
-}
-
-/// Leaves each search gathers per `Tree::step` before waiting for their evaluations, from
-/// `TZ_VIRTUAL_LEAVES` (default 1, i.e. plain sequential MCTS) unless `set_virtual_leaves`
-/// fixed it first. Read once per process.
-pub fn virtual_leaves_from_env() -> usize {
-    *VIRTUAL_LEAVES.get_or_init(|| match std::env::var("TZ_VIRTUAL_LEAVES") {
-        Ok(value) => match value.trim().parse::<usize>() {
-            Ok(k) if k >= 1 => k,
-            _ => panic!("TZ_VIRTUAL_LEAVES must be a whole number >= 1, got {value:?}"),
-        },
-        Err(_) => 1,
-    })
-}
+/// Leaves each search gathers per `Tree::step` before waiting for their evaluations
+/// (virtual-loss leaf batching). 1 is plain sequential MCTS, the default; set it to e.g. 8
+/// to opt in. Must be at least 1.
+pub const VIRTUAL_LEAVES: usize = 1;
 
 /// name of the current generator thread, used to check each evaluation comes back to its sender
 fn generator_thread_name() -> String {
@@ -177,7 +161,7 @@ impl Tree {
             settings,
             pv,
             root_net_policy: None,
-            virtual_leaves: virtual_leaves_from_env(),
+            virtual_leaves: VIRTUAL_LEAVES,
         }
     }
 
@@ -620,11 +604,11 @@ impl Tree {
     ) -> Receiver<ReturnMessage> {
         debug_print!("    eval_and_expand:");
 
-        let input = board_input(bs);
+        let input_tensor = convert_board(bs);
 
         let (resender_send, resender_recv) = flume::bounded::<ReturnMessage>(1);
         let pack = Packet {
-            job: input,
+            job: input_tensor,
             resender: resender_send,
             id: generator_thread_name(),
         };
@@ -650,7 +634,7 @@ impl Tree {
 
         assert!(generator_thread_name() == output.id);
         let idx_li = process_board_output(
-            (&output.packet.0[..], &output.packet.1[..]),
+            (&output.packet.0, &output.packet.1),
             &selected_node_idx,
             self,
             bs,
@@ -1003,48 +987,6 @@ pub async fn get_move(
     ZeroEvaluationAbs,
     u32,
 ) {
-    get_move_with_early_stop(bs, tensor_exe_send, settings, id, cache, stop_signal, false).await
-}
-
-impl Tree {
-    /// True when the most-visited root child leads every other child by more visits than the
-    /// search has left before `target_visits`, so no other move can become the most visited
-    /// (the move `get_move` returns). Strict: a possible tie is not decided.
-    pub fn root_move_decided(&self, target_visits: u32) -> bool {
-        let remaining = target_visits.saturating_sub(self.nodes[0].visits);
-        let mut best = 0;
-        let mut second = 0;
-        for child in self.nodes[0].children.clone() {
-            let v = self.nodes[child].visits;
-            if v > best {
-                second = best;
-                best = v;
-            } else if v > second {
-                second = v;
-            }
-        }
-        best > 0 && best - second > remaining
-    }
-}
-
-/// `get_move`, optionally stopping as soon as the most-visited root move is decided
-/// (`Tree::root_move_decided`). With `early_stop` the move returned is the same as a full
-/// search's, but the visit distribution (the policy target) comes from fewer visits.
-pub async fn get_move_with_early_stop(
-    bs: BoardStack,
-    tensor_exe_send: &Sender<Packet>,
-    settings: SearchSettings,
-    id: usize,
-    cache: &mut LruCache<CacheEntryKey, ZeroEvaluationAbs>,
-    stop_signal: Option<Receiver<crate::uci::UCIMsg>>,
-    early_stop: bool,
-) -> (
-    Move,
-    ZeroEvaluationAbs,
-    Option<Vec<usize>>,
-    ZeroEvaluationAbs,
-    u32,
-) {
     let sw_uci = Instant::now();
     let thread_name = format!("generator-{}", id);
     let mut tree = Tree::new(bs, settings);
@@ -1056,12 +998,6 @@ pub async fn get_move_with_early_stop(
             let min_visits_for_policy = 2;
             let target_visits = (max_nodes as u32).max(min_visits_for_policy);
             while tree.nodes[0].visits < target_visits {
-                if early_stop
-                    && tree.nodes[0].visits >= min_visits_for_policy
-                    && tree.root_move_decided(target_visits)
-                {
-                    break;
-                }
                 if let Some(ref signal) = stop_signal {
                     match signal.try_recv() {
                         Ok(_) if tree.nodes[0].visits >= min_visits_for_policy => break,

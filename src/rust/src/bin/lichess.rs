@@ -4,7 +4,7 @@
 //! shared batched executors and plays on Lichess: it accepts incoming challenges and
 //! challenges other online bots.
 //!
-//! Recording games for training is off by default. Set `TZ_LICHESS_COLLECT_DATA=1` to send
+//! Recording games for training is off by default. Set `COLLECT_DATA = true` to send
 //! finished games to the server like self-play games.
 
 use std::{
@@ -44,45 +44,33 @@ pub struct Config {
 }
 
 impl Config {
-    fn from_env() -> Self {
-        let num_executors = env_usize("TZ_NUM_EXECUTORS", 2);
-        let batch_size = env_usize("TZ_BATCH_SIZE", 1024);
+    /// Settings are the constants below; only the API token (a secret) comes from the
+    /// environment or `.env`.
+    fn new() -> Self {
         Self {
             token: env::var("LICHESS_API_KEY").expect("LICHESS_API_KEY must be set"),
-            server_addr: format!(
-                "{}:{}",
-                env::var("TZ_SERVER_HOST").unwrap_or_else(|_| "127.0.0.1".into()),
-                env::var("TZ_SERVER_PORT").unwrap_or_else(|_| "38475".into()),
-            ),
-            num_executors,
-            batch_size,
-            queue_capacity: env_usize("TZ_TENSOR_QUEUE_CAPACITY", batch_size * num_executors),
-            max_concurrent_games: env_usize("TZ_MAX_CONCURRENT_GAMES", 4),
-            collect_data: env_bool("TZ_LICHESS_COLLECT_DATA"),
+            server_addr: format!("{SERVER_HOST}:{SERVER_PORT}"),
+            num_executors: NUM_EXECUTORS,
+            batch_size: BATCH_SIZE,
+            queue_capacity: BATCH_SIZE * NUM_EXECUTORS,
+            max_concurrent_games: MAX_CONCURRENT_GAMES,
+            collect_data: COLLECT_DATA,
         }
     }
 }
 
-fn env_usize(name: &str, default: usize) -> usize {
-    env::var(name)
-        .ok()
-        .and_then(|value| value.parse().ok())
-        .unwrap_or(default)
-        .max(1)
-}
-
-fn env_bool(name: &str) -> bool {
-    env::var(name).is_ok_and(|value| {
-        matches!(
-            value.trim().to_ascii_lowercase().as_str(),
-            "1" | "true" | "yes" | "on"
-        )
-    })
-}
+const SERVER_HOST: &str = "127.0.0.1";
+const SERVER_PORT: u16 = 38475;
+const NUM_EXECUTORS: usize = 2;
+const BATCH_SIZE: usize = 1024;
+/// Games played at once; extra challenges are declined.
+const MAX_CONCURRENT_GAMES: usize = 4;
+/// Record finished games and send them to the server for training.
+const COLLECT_DATA: bool = false;
 
 fn main() {
     dotenv::dotenv().ok();
-    let config = Config::from_env();
+    let config = Config::new();
     println!(
         "[Lichess] {} executor(s), batch size {}, up to {} concurrent games, \
          training data collection {}",
@@ -92,7 +80,7 @@ fn main() {
         if config.collect_data {
             "ON"
         } else {
-            "off (set TZ_LICHESS_COLLECT_DATA=1 to enable)"
+            "off (set COLLECT_DATA in lichess.rs to enable)"
         }
     );
 

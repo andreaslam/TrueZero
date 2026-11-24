@@ -3,16 +3,13 @@ import io
 import json
 import os
 import queue
-import random
 import re
 import socket
-import sys
 import threading
 import time
 import warnings
 
 import network as network
-import numpy as np
 import torch
 
 # the Rust self-play engine loads TorchScript (.pt) via libtorch, so torch.export is not
@@ -25,19 +22,7 @@ from lib.games import Game
 from lib.logger import Logger
 from lib.loop import LoopBuffer
 from lib.train import ScalarTarget, TrainSettings
-import runconfig
 from paths import data_dir, data_path
-from ladder import LadderRunner
-from runconfig import RESTART_EXIT_CODE, record_received_file
-from telemetry import (
-    LogTailer,
-    SelfplayHealth,
-    Telemetry,
-    buffer_row,
-    gate_row,
-    logger_row,
-    tailed_log_paths,
-)
 from torch import optim
 
 
@@ -117,84 +102,13 @@ def model_weights_checksum(model):
     return checksum.hexdigest()
 
 
-class FullSearchPolicyFile(DataFile):
-    """A replay file whose fast-search positions carry no policy target.
-
-    With playout cap randomisation most moves are fast searches (few visits, no
-    root noise, possibly stopped early). Their visit distribution is close to the
-    network's own policy, so training the policy on it mostly teaches the net to
-    copy itself; KataGo trains the policy on full searches only. The inherited
-    trainer ignores `is_full_search`, so here every fast-search position gets
-    policy values of -1, lib's own marker for "no policy target": such a row
-    adds no policy loss or gradient and is left out of policy accuracy. Value,
-    WDL and moves-left targets are unchanged. Neither lib nor the file format is
-    modified, and this applies to files already in the replay buffer.
-    """
-
-    def load_position(self, pi):
-        position = super().load_position(pi)
-        if not position.is_full_search:
-            position.policy_values = np.full_like(position.policy_values, -1.0)
-        return position
-
-    def with_new_handles(self):
-        # The samplers reopen files through this, so it must keep the subclass.
-        other = super().with_new_handles()
-        return FullSearchPolicyFile(other.info, other.bin_handle, other.off_handle)
-
-
 def load_file(games_path):
-    f = DataFile.open(Game.find("chess"), games_path)
-    return FullSearchPolicyFile(f.info, f.bin_handle, f.off_handle)
+    return DataFile.open(Game.find("chess"), games_path)
 
 
-# Weight of the policy loss per position that has a policy target.
-POLICY_WEIGHT = 1.0
+HOST = "127.0.0.1"
+PORT = 38475
 
-
-def policy_target_fraction(batch):
-    """Fraction of the batch's positions that have a policy target (full searches)."""
-    has_target = (batch.policy_values != -1).any(dim=1)
-    return has_target.float().mean().item()
-
-
-def policy_entropy_row(model, batch, prefix):
-    """Mean entropy (nats) of the net's policy over legal moves and of the search target,
-    over positions with a policy target (full searches). A net whose entropy collapses
-    far below the target's is overconfident; one stuck high is not learning the policy."""
-    scalars, logits = model(batch.input_full)
-    has_target = (batch.policy_values != -1).any(dim=1)
-    if not has_target.any():
-        return {}
-    legal = batch.policy_values != -1
-    picked = torch.gather(logits.flatten(1), 1, batch.policy_indices)
-    picked = picked.masked_fill(~legal, float("-inf"))
-    logp = torch.log_softmax(picked[has_target], dim=1)
-    p = logp.exp()
-    net_h = -(p * logp.masked_fill(~legal[has_target], 0.0)).sum(dim=1).mean()
-    target = batch.policy_values[has_target].clamp(min=0.0)
-    target_h = -(target * torch.log(target.clamp(min=1e-12))).sum(dim=1).mean()
-    return {
-        f"policy-entropy/{prefix} net": net_h.item(),
-        f"policy-entropy/{prefix} target": target_h.item(),
-    }
-
-
-def set_policy_weight(train_settings, batch):
-    """Keep the policy's share of the loss independent of how many positions are masked.
-
-    lib averages the policy loss over the whole batch, so masking fast searches
-    (FullSearchPolicyFile) would shrink it by the full-search fraction p and shift
-    the balance towards value. Scaling by 1/p restores the per-target weight it had
-    before playout cap randomisation. Returns p.
-    """
-    fraction = policy_target_fraction(batch)
-    train_settings.policy_weight = POLICY_WEIGHT / max(fraction, 1.0 / len(batch))
-    return fraction
-
-
-# The training hyperparameters below are the defaults (equal to truezero.example.toml);
-# main() replaces them with truezero.toml's through apply_run_config.
 BUFFER_SIZE = 1500000
 BATCH_SIZE = 2048
 
@@ -220,202 +134,33 @@ MIN_TRAINING_STEPS = 16
 # Instead, perform a small bootstrap session over the full replay buffer.
 STARTUP_TRAINING_STEPS = 16
 
-TEST_FRACTION = 0.2
-WEIGHT_DECAY = 1e-4
-LOSS_WEIGHTS = {
-    "value_weight": 1.0,
-    "wdl_weight": 1.0,
-    "moves_left_weight": 0.1,
-    "moves_left_delta": 0.1,
-    "clip_norm": 5.0,
-}
-
 assert BATCH_SIZE > 0 and (BATCH_SIZE & (BATCH_SIZE - 1)) == 0
 
-def bind_run_paths():
-    """Point the trainer's files at the data root (the current run's folder). main() calls
-    this once runconfig.start has fixed the root."""
-    global DATAFILE_PATH, TRAINING_LOG_PATH, LOG_NPZ_PATH, TRAINER_STATE_PATH
-    DATAFILE_PATH = data_path("hidden/datafile.txt")
-    TRAINING_LOG_PATH = data_path("hidden/traininglog.txt")
-    LOG_NPZ_PATH = data_path("log.npz")
-    TRAINER_STATE_PATH = data_path("hidden/trainer_state.pt")
+data_dir("hidden")
 
+DATAFILE_PATH = data_path("hidden/datafile.txt")
+TRAINING_LOG_PATH = data_path("hidden/traininglog.txt")
+LOG_NPZ_PATH = data_path("log.npz")
 
-bind_run_paths()
+# Architecture of tz_0, created when nets/ holds no tz_N.pt (a new run).
+NEW_NET_RES_BLOCKS = 10
+NEW_NET_HIDDEN = 128
+TRAINER_STATE_PATH = data_path("hidden/trainer_state.pt")
 TRAINER_STATE_VERSION = 1
-
-# The network a fresh run starts from (truezero.toml [net]); main() sets it.
-NET_CONFIG = {"arch": "TrueNet", "blocks": 10, "channels": 128}
 
 LAST_SENT_NET_CHECKSUM = None
 
-# This trainer's run identity (runconfig.StartIdentity), set by main().
-RUN_IDENTITY = None
-
-# Optional W&B telemetry (telemetry.py), set by main(); None in tests and tools.
-TELEMETRY = None
-SELFPLAY_HEALTH = SelfplayHealth()
-
-
-def telemetry_log(row_fn):
-    """Log `row_fn()` if telemetry is on. Metrics must never stop training."""
-    if TELEMETRY is None or not TELEMETRY.enabled:
-        return
-    try:
-        TELEMETRY.log(row_fn())
-    except Exception as e:
-        print(f"[telemetry][Warning] {e!r}")
-
 
 def create_optimizer(model):
-    # The learning rate is set before every step by LrSchedule.apply.
     return optim.AdamW(
         params=model.parameters(),
         lr=1e-3,
-        weight_decay=WEIGHT_DECAY,
+        weight_decay=1e-4,
     )
 
 
-# ---------------------------------------------------------------------------
-# Learning-rate schedule
-#
-# Modelled on what AlphaZero-style engines do for continual self-play training:
-#
-# - A warm-up at the start: KataGo trains its first 2M samples at 1/20 rising to
-#   1x of the full rate; Lc0 ramps linearly over `warmup_steps`.
-# - Then piecewise-constant drops keyed on how much has been trained, never on
-#   a planned end point: AlphaZero 0.2 -> 0.02 -> 0.002 -> 0.0002 over 700k
-#   steps; Lc0 `lr_values`/`lr_boundaries`; KataGo's `-lr-schedule` keyed on
-#   samples trained. A cosine-to-zero schedule needs a known run length, which
-#   continual training does not have, so it is not used here.
-#
-# The position in the schedule is the number of samples trained (steps times
-# batch size, like KataGo's global_step_samples), so the schedule is unchanged
-# if BATCH_SIZE changes. It is saved in the trainer checkpoint with the
-# optimiser. A fresh optimiser starts the schedule at zero, so it warms up
-# again rather than taking full-rate steps from empty Adam moments.
-#
-# Set in truezero.toml [trainer]:
-#   lr_schedule        "samples:lr,..." piecewise-constant points, starting
-#                      at 0; counts take K/M/B suffixes, e.g. "0:1e-3,50M:5e-4"
-#   lr_warmup_samples  warm-up length in samples (0 disables warm-up)
-# ---------------------------------------------------------------------------
-
-LR_SCHEDULE = "0:1e-3,50M:5e-4,100M:2.5e-4,200M:1e-4"
-LR_WARMUP_SAMPLES = "1M"
-
-# The warm-up starts at this fraction of the scheduled rate (KataGo: 1/20).
-LR_WARMUP_START_FRACTION = 0.05
-
-
-def parse_sample_count(text):
-    text = text.strip().upper()
-    scale = {"K": 10**3, "M": 10**6, "B": 10**9}.get(text[-1:], 1)
-    if scale != 1:
-        text = text[:-1]
-    value = float(text) * scale
-    if value < 0 or value != int(value):
-        raise ValueError(f"invalid sample count {text!r}")
-    return int(value)
-
-
-def parse_lr_schedule(text):
-    """Parse "samples:lr,samples:lr,..." into sorted (samples, lr) points."""
-    points = []
-    for item in text.split(","):
-        if not item.strip():
-            continue
-        samples, lr = item.split(":")
-        lr = float(lr)
-        if not lr > 0:
-            raise ValueError(f"learning rate must be positive, got {lr}")
-        points.append((parse_sample_count(samples), lr))
-
-    points.sort()
-    if not points or points[0][0] != 0:
-        raise ValueError("the LR schedule must start at sample 0")
-    if len({s for s, _ in points}) != len(points):
-        raise ValueError("the LR schedule repeats a sample count")
-    return points
-
-
-class LrSchedule:
-    """Warm-up then piecewise-constant learning rate, keyed on samples trained."""
-
-    def __init__(self, points, warmup_samples, samples_trained=0):
-        self.points = points
-        self.warmup_samples = warmup_samples
-        self.samples_trained = samples_trained
-
-    @classmethod
-    def from_config(cls):
-        """A schedule at sample 0 from LR_SCHEDULE and LR_WARMUP_SAMPLES (truezero.toml)."""
-        return cls(
-            parse_lr_schedule(LR_SCHEDULE),
-            parse_sample_count(LR_WARMUP_SAMPLES),
-        )
-
-    def lr(self):
-        lr = self.points[0][1]
-        for start, value in self.points:
-            if self.samples_trained >= start:
-                lr = value
-
-        if self.samples_trained < self.warmup_samples:
-            progress = self.samples_trained / self.warmup_samples
-            lr *= LR_WARMUP_START_FRACTION + (1 - LR_WARMUP_START_FRACTION) * progress
-
-        return lr
-
-    def apply(self, op):
-        """Set the learning rate for the next optimiser step and return it."""
-        lr = self.lr()
-        for group in op.param_groups:
-            group["lr"] = lr
-        return lr
-
-    def advance(self, batch_size):
-        self.samples_trained += batch_size
-
-    def state_dict(self):
-        return {"samples_trained": self.samples_trained}
-
-    def load_state_dict(self, state):
-        samples_trained = int(state["samples_trained"])
-        if samples_trained < 0:
-            raise ValueError(f"invalid samples_trained {samples_trained}")
-        self.samples_trained = samples_trained
-
-
-def scheduled_train_step(train_settings, batch, model, op, schedule, log):
-    """One optimiser step at the scheduled learning rate."""
-    lr = schedule.apply(op)
-    fraction = set_policy_weight(train_settings, batch)
-    train_settings.train_step(
-        batch,
-        network=model,
-        optimizer=op,
-        logger=log,
-    )
-    schedule.advance(BATCH_SIZE)
-    log.log("schedule", "lr", lr)
-    # Separate group so the plotter does not draw lr against a count in the millions.
-    log.log("samples", "trained", schedule.samples_trained)
-    log.log("policy-targets", "fraction", fraction)
-    if TELEMETRY is not None:
-        TELEMETRY.set_samples(schedule.samples_trained)
-    telemetry_log(
-        lambda: {
-            **logger_row(log, ("train",), groups=("grad_norm", "param_norm")),
-            "train/lr": lr,
-            "train/policy_target_fraction": fraction,
-        }
-    )
-
-
-def save_trainer_state(model, op, schedule, accepted_gen, candidate_gen, path=None):
-    """Checkpoint the training weights, optimiser and LR schedule after a round.
+def save_trainer_state(model, op, accepted_gen, candidate_gen, path=None):
+    """Checkpoint the training weights and optimiser after a training round.
 
     The accepted net on disk is not enough to resume training: a rejected
     candidate does not reset the training weights, and AdamW's moment
@@ -439,7 +184,6 @@ def save_trainer_state(model, op, schedule, accepted_gen, candidate_gen, path=No
             "candidate_gen": candidate_gen,
             "model": model.state_dict(),
             "optimizer": op.state_dict(),
-            "schedule": schedule.state_dict(),
         },
         buffer,
     )
@@ -462,24 +206,20 @@ def save_trainer_state(model, op, schedule, accepted_gen, candidate_gen, path=No
 
 
 def load_trainer_state(model, accepted_gen, device, path=None):
-    """Restore the training weights, optimiser and schedule saved by save_trainer_state.
+    """Restore the training weights and optimiser saved by save_trainer_state.
 
-    Returns the optimiser and LR schedule to train with. The checkpoint is used only if it
+    Returns the optimiser to train with. The checkpoint is used only if it
     continues from the accepted net: it was written while `accepted_gen` was
     accepted, or by the round whose candidate became `accepted_gen` (whose
     weights are exactly that net). Otherwise, or if the file is unreadable or
-    does not fit the model, `model` keeps the accepted net's weights, and a fresh
-    optimiser and a schedule at sample 0 (so in warm-up) are returned.
+    does not fit the model, `model` keeps the accepted net's weights and a fresh
+    optimiser is returned.
     """
     path = path or TRAINER_STATE_PATH
 
-    # Parsed outside the try below: a bad lr_schedule must stop the trainer,
-    # not be reported as an unreadable checkpoint.
-    LrSchedule.from_config()
-
     if not os.path.exists(path):
         print("[Training] No trainer state found; starting a fresh optimiser.")
-        return create_optimizer(model), LrSchedule.from_config()
+        return create_optimizer(model)
 
     try:
         state = torch.load(path, map_location=device, weights_only=True)
@@ -500,70 +240,19 @@ def load_trainer_state(model, accepted_gen, device, path=None):
         ):
             raise ValueError("saved weights do not match the network architecture")
 
-        schedule = LrSchedule.from_config()
-        schedule.load_state_dict(state["schedule"])
         op = create_optimizer(model)
         op.load_state_dict(state["optimizer"])
         model.load_state_dict(saved)
 
     except Exception as e:
         print(f"[Warning] ignoring trainer state {path}: {e!r}")
-        return create_optimizer(model), LrSchedule.from_config()
+        return create_optimizer(model)
 
     print(
-        "[Training] Resumed training weights, optimiser and LR schedule from "
-        f"{path} (saved after training candidate {state['candidate_gen']}; "
-        f"{schedule.samples_trained:,} samples trained, lr {schedule.lr():.3g})."
+        "[Training] Resumed training weights and optimiser from "
+        f"{path} (saved after training candidate {state['candidate_gen']})."
     )
-    return op, schedule
-
-
-def apply_run_config(cfg):
-    """Set the training hyperparameters from the effective truezero.toml."""
-    global BUFFER_SIZE, BATCH_SIZE, MIN_BUFFER_TO_TRAIN, EPOCHS_PER_GEN
-    global RECENT_BATCH_FRACTION, MIN_TRAINING_STEPS, STARTUP_TRAINING_STEPS
-    global TEST_FRACTION, LR_SCHEDULE, LR_WARMUP_SAMPLES, WEIGHT_DECAY, POLICY_WEIGHT
-    t = cfg["trainer"]
-    BUFFER_SIZE = t["buffer_size"]
-    BATCH_SIZE = t["batch_size"]
-    MIN_BUFFER_TO_TRAIN = t["min_buffer_to_train"]
-    EPOCHS_PER_GEN = float(t["epochs_per_gen"])
-    RECENT_BATCH_FRACTION = float(t["recent_batch_fraction"])
-    MIN_TRAINING_STEPS = t["min_training_steps"]
-    STARTUP_TRAINING_STEPS = t["startup_training_steps"]
-    TEST_FRACTION = float(t["test_fraction"])
-    LR_SCHEDULE = t["lr_schedule"]
-    LR_WARMUP_SAMPLES = t["lr_warmup_samples"]
-    WEIGHT_DECAY = float(t["weight_decay"])
-    POLICY_WEIGHT = float(t["policy_weight"])
-    for key in LOSS_WEIGHTS:
-        LOSS_WEIGHTS[key] = float(t[key])
-    # Fail now, not at the first training round.
-    LrSchedule.from_config()
-
-
-def seed_everything(seed):
-    random.seed(seed)
-    np.random.seed(seed % 2**32)
-    torch.manual_seed(seed)
-
-
-def run_change(raw_data, run_id):
-    """Why this trainer must restart (the server started a new run), or None."""
-    purpose = raw_data.get("purpose") if isinstance(raw_data, dict) else None
-    if not isinstance(purpose, dict):
-        return None
-    if "ResetRun" in purpose:
-        return f"new run {purpose['ResetRun']}"
-    if "RunInfo" in purpose and purpose["RunInfo"] != run_id:
-        return f"the server is on run {purpose['RunInfo']}, not {run_id}"
-    return None
-
-
-def new_net(net_cfg):
-    """A fresh network from truezero.toml [net]."""
-    cls = network.TrueNet if net_cfg["arch"] == "TrueNet" else network.TrueNetXS
-    return cls(num_resBlocks=net_cfg["blocks"], num_hidden=net_cfg["channels"])
+    return op
 
 
 def receiver_loop(server, message_queue, receiver_stop_event):
@@ -609,23 +298,6 @@ def get_message(message_queue, timeout=0.05):
 
 
 def main():
-    # Settings, the current run (created by the server) and the start log come first.
-    run_cfg, run_identity, _run_dir = runconfig.start("trainer")
-    bind_run_paths()
-    data_dir("hidden")
-    apply_run_config(run_cfg)
-    global RUN_IDENTITY, TELEMETRY, NET_CONFIG
-    RUN_IDENTITY = run_identity
-    NET_CONFIG = run_cfg["net"]
-    TELEMETRY = Telemetry(run_cfg, run_identity)
-    LogTailer(
-        TELEMETRY,
-        tailed_log_paths(runconfig.runs_dir(run_cfg)),
-        flush_seconds=float(run_cfg["wandb"]["flush_seconds"]),
-    ).start()
-    ladder = LadderRunner(run_cfg["ladder"], TELEMETRY)
-    seed_everything(run_cfg["run"]["seed"])
-
     game = Game.find("chess")
 
     # Select exactly one device.
@@ -671,9 +343,7 @@ def main():
 
     print(f"starting generation: {starting_gen}")
 
-    # TZ_SERVER_HOST: Docker, where the server is another container.
-    host = os.environ.get("TZ_SERVER_HOST") or run_cfg["server"]["host"]
-    server = Server(host, run_cfg["server"]["port"])
+    server = Server(HOST, PORT)
     server.connect()
 
     # Verification happens synchronously before the receiver thread starts.
@@ -687,31 +357,26 @@ def main():
     loopbuf = LoopBuffer(
         game,
         target_positions=BUFFER_SIZE,
-        test_fraction=TEST_FRACTION,
+        test_fraction=0.2,
     )
 
     train_settings = TrainSettings(
         game=game,
         scalar_target=ScalarTarget.Final,
-        value_weight=LOSS_WEIGHTS["value_weight"],
-        wdl_weight=LOSS_WEIGHTS["wdl_weight"],
-        moves_left_weight=LOSS_WEIGHTS["moves_left_weight"],
-        moves_left_delta=LOSS_WEIGHTS["moves_left_delta"],
-        policy_weight=POLICY_WEIGHT,
+        value_weight=1.0,
+        wdl_weight=1.0,
+        moves_left_weight=0.1,
+        moves_left_delta=0.1,
+        policy_weight=1,
         sim_weight=0.0,
         train_in_eval_mode=False,
-        clip_norm=LOSS_WEIGHTS["clip_norm"],
+        clip_norm=5.0,
         mask_policy=True,
     )
 
     # Resume the training weights (which may be ahead of the accepted net) and
     # the optimiser. Self-play still gets `accepted_model_path`.
-    op, schedule = load_trainer_state(model, accepted_gen, device)
-    print(
-        f"[Training] LR schedule {schedule.points}, warm-up "
-        f"{schedule.warmup_samples:,} samples; now at "
-        f"{schedule.samples_trained:,} samples, lr {schedule.lr():.3g}"
-    )
+    op = load_trainer_state(model, accepted_gen, device)
 
     log = load_previous_data(
         data_paths,
@@ -792,18 +457,6 @@ def main():
             received_data_string = str(raw_data)
 
             # -------------------------------------------------------
-            # New run (`server reset`): restart under the launcher.
-            # -------------------------------------------------------
-
-            if (why := run_change(raw_data, run_identity.run_id)) is not None:
-                print(f"[run] {why}; {runconfig.RESTART_SENTINEL} the trainer.")
-                TELEMETRY.finish()
-                sys.stdout.flush()
-                # Not server.close(): closing the socket file while the receiver thread is
-                # blocked reading it deadlocks on the file's lock. Exiting closes it.
-                os._exit(RESTART_EXIT_CODE)
-
-            # -------------------------------------------------------
             # Network request.
             # -------------------------------------------------------
 
@@ -824,9 +477,6 @@ def main():
             test_result = extract_test_result(raw_data)
 
             if test_result is not None:
-                if pending_candidate_gen is not None:
-                    telemetry_log(lambda: gate_row(test_result, pending_candidate_gen))
-
                 if pending_candidate_path is None or pending_candidate_gen is None:
                     print("[Training] Ignoring SPRT result with no pending candidate")
 
@@ -842,11 +492,6 @@ def main():
                     )
 
                     print(f"[Training] Candidate accepted: {accepted_model_path}")
-                    # Training is paused while a candidate is pending, so the schedule's
-                    # position is exactly the samples this net was trained on.
-                    ladder.maybe_run(
-                        accepted_model_path, accepted_gen, schedule.samples_trained
-                    )
 
                     pending_candidate_path = None
                     pending_candidate_gen = None
@@ -951,7 +596,6 @@ def main():
                 loopbuf=loopbuf,
                 train_settings=train_settings,
                 op=op,
-                schedule=schedule,
                 log=log,
                 data=None,
                 startup=True,
@@ -989,7 +633,6 @@ def main():
                 loopbuf=loopbuf,
                 train_settings=train_settings,
                 op=op,
-                schedule=schedule,
                 log=log,
                 data=data if "data" in locals() else None,
                 startup=False,
@@ -1086,10 +729,8 @@ def extract_incoming_data_given_bytes(
         f.write(path + "\n")
 
     print(path)
-    record_received_file(path, bin_data, RUN_IDENTITY)
 
     data = load_file(path)
-    telemetry_log(lambda: SELFPLAY_HEALTH.file_row(data))
 
     loopbuf.append(
         log,
@@ -1159,7 +800,6 @@ def full_train_and_send(
     loopbuf,
     train_settings,
     op,
-    schedule,
     log,
     data=None,
     startup=False,
@@ -1184,7 +824,6 @@ def full_train_and_send(
             model=model,
             train_settings=train_settings,
             op=op,
-            schedule=schedule,
             log=log,
             train_sampler=train_sampler,
             num_steps_training=num_steps_training,
@@ -1224,7 +863,6 @@ def full_train_and_send(
             model=model,
             train_settings=train_settings,
             op=op,
-            schedule=schedule,
             log=log,
             train_sampler=train_sampler,
             recent_train_sampler=recent_train_sampler,
@@ -1234,25 +872,16 @@ def full_train_and_send(
     save_trainer_state(
         model,
         op,
-        schedule,
         accepted_gen=starting_gen - 1,
         candidate_gen=starting_gen,
     )
 
-    entropy = test_net(
+    test_net(
         model,
         train_settings,
         log,
         test_sampler,
         last_gen_test_sampler,
-    )
-    telemetry_log(
-        lambda: {
-            **logger_row(log, ("test", "last gen test")),
-            **entropy,
-            **buffer_row(loopbuf),
-            "train/candidate_gen": starting_gen,
-        }
     )
 
     log.finished_data()
@@ -1283,7 +912,6 @@ def train_startup(
     model,
     train_settings,
     op,
-    schedule,
     log,
     train_sampler,
     num_steps_training,
@@ -1302,7 +930,12 @@ def train_startup(
 
         batch = train_sampler.next_batch()
 
-        scheduled_train_step(train_settings, batch, model, op, schedule, log)
+        train_settings.train_step(
+            batch,
+            network=model,
+            optimizer=op,
+            logger=log,
+        )
 
     train_sampler.close()
 
@@ -1401,20 +1034,15 @@ def test_net(
 
         test_batch = test_sampler.next_batch()
 
-        set_policy_weight(train_settings, test_batch)
         train_settings.evaluate_batch(
             network=model,
             batch=test_batch,
             log_prefix="test",
             logger=log,
         )
-        entropy = {}
-        if TELEMETRY is not None and TELEMETRY.enabled:
-            entropy = policy_entropy_row(model, test_batch, "test")
 
         last_gen_test_batch = last_gen_test_sampler.next_batch()
 
-        set_policy_weight(train_settings, last_gen_test_batch)
         train_settings.evaluate_batch(
             network=model,
             batch=last_gen_test_batch,
@@ -1424,14 +1052,12 @@ def test_net(
 
     test_sampler.close()
     last_gen_test_sampler.close()
-    return entropy
 
 
 def train_net(
     model,
     train_settings,
     op,
-    schedule,
     log,
     train_sampler,
     recent_train_sampler,
@@ -1452,7 +1078,12 @@ def train_net(
 
         batch = sampler.next_batch()
 
-        scheduled_train_step(train_settings, batch, model, op, schedule, log)
+        train_settings.train_step(
+            batch,
+            network=model,
+            optimizer=op,
+            logger=log,
+        )
 
     train_sampler.close()
     recent_train_sampler.close()
@@ -1593,7 +1224,6 @@ def extract_incoming_data_given_path(
         f.write(file_path + "\n")
 
     data = load_file(file_path)
-    telemetry_log(lambda: SELFPLAY_HEALTH.file_row(data))
 
     loopbuf.append(
         log,
@@ -1789,6 +1419,22 @@ def get_model_path(training_nets):
     return model_path
 
 
+def reset_log_npz(attempts=5):
+    """Delete log.npz, retrying briefly (network drives can hold the file for a moment)."""
+    for attempt in range(attempts):
+        try:
+            os.remove(LOG_NPZ_PATH)
+            print("[Training] New run: reset log.npz")
+            return
+        except FileNotFoundError:
+            return
+        except OSError as e:
+            if attempt == attempts - 1:
+                raise
+            print(f"[Warning] could not delete log.npz yet ({e!r}); retrying")
+            time.sleep(1.0)
+
+
 def check_net_exists(
     device,
     pattern,
@@ -1819,9 +1465,17 @@ def check_net_exists(
     training_nets = list(net_id.keys())
 
     if not os.listdir(data_dir("nets")) or not training_nets:
+        # A brand new run must not inherit metrics from a previous run. Done before tz_0
+        # exists, so a failure here leaves the next start still treated as a new run.
+        reset_log_npz()
+
         with torch.no_grad():
-            net = torch.jit.script(new_net(NET_CONFIG).to(device)).eval()
-            print(f"[Training] New run: created tz_0 from {NET_CONFIG}")
+            net = torch.jit.script(
+                network.TrueNet(
+                    num_resBlocks=NEW_NET_RES_BLOCKS,
+                    num_hidden=NEW_NET_HIDDEN,
+                ).to(device)
+            ).eval()
 
             torch.jit.save(
                 net,
@@ -1833,11 +1487,6 @@ def check_net_exists(
             "w+",
         ) as f:
             f.write(data_path("nets/tz_0.pt") + "\n")
-
-        # A brand new run must not inherit metrics from a previous run.
-        if os.path.exists(LOG_NPZ_PATH):
-            os.remove(LOG_NPZ_PATH)
-            print("[Training] New run: reset log.npz")
 
         training_nets.append(data_path("nets/tz_0.pt"))
 

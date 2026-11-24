@@ -7,16 +7,9 @@ use crate::{
 };
 use cozy_chess::{Color, File, Move, Piece, Square};
 use lru::LruCache;
-use tch::{Device, IValue, Tensor};
+use tch::{Device, IValue, Kind, Tensor};
 
 pub fn eval_state(board: Tensor, net: &Net) -> anyhow::Result<(Tensor, Tensor)> {
-    let (board_eval, policy) = eval_state_on_device(board, net)?;
-    Ok((board_eval.to(Device::Cpu), policy.to(Device::Cpu)))
-}
-
-/// Like [`eval_state`], but leaves the outputs on the network's device, so the caller can copy
-/// them into buffers it reuses across batches.
-pub fn eval_state_on_device(board: Tensor, net: &Net) -> anyhow::Result<(Tensor, Tensor)> {
     // miracle mps fix???
     let _no_grad = tch::no_grad_guard();
 
@@ -43,7 +36,8 @@ pub fn eval_state_on_device(board: Tensor, net: &Net) -> anyhow::Result<(Tensor,
         a => panic!("the output is not a Tensor {:?}", a),
     };
 
-    let (board_eval, policy) = (board_eval.shallow_clone(), policy.shallow_clone());
+    let board_eval = board_eval.to(Device::Cpu);
+    let policy = policy.to(Device::Cpu);
 
     drop(output_tensor);
 
@@ -206,18 +200,9 @@ pub fn board_data(bs: &BoardStack) -> (Vec<f32>, Vec<bool>) {
 /// Network input, identical to what the replay files store (KZero: the stored input is the
 /// network input). Channel 7 is the raw halfmove clock; TrueNet scales it internally.
 pub fn convert_board(bs: &BoardStack) -> Tensor {
-    Tensor::from_slice(&board_input(bs))
-}
-
-/// Number of floats in one position's network input (21 planes of 8x8).
-pub const INPUT_LEN: usize = 21 * 64;
-
-/// The network input for one position as plain floats, the same values as [`convert_board`].
-/// Self-play sends this to the executor, which packs a whole batch into one reused buffer.
-pub fn board_input(bs: &BoardStack) -> Vec<f32> {
     let (scalar_data, pieces_sqs) = board_data(bs);
 
-    let mut all_data = Vec::with_capacity(INPUT_LEN);
+    let mut all_data = Vec::with_capacity(21 * 64);
 
     for value in &scalar_data {
         for _ in 0..64 {
@@ -227,17 +212,9 @@ pub fn board_input(bs: &BoardStack) -> Vec<f32> {
 
     all_data.extend(pieces_sqs.iter().map(|&x| x as u8 as f32));
 
-    debug_assert_eq!(all_data.len(), INPUT_LEN);
+    debug_assert_eq!(all_data.len(), 21 * 64);
 
-    all_data
-}
-
-/// Numerically stable softmax over a small slice.
-fn softmax(logits: &[f32]) -> Vec<f32> {
-    let max = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
-    let exp: Vec<f32> = logits.iter().map(|&x| (x - max).exp()).collect();
-    let sum: f32 = exp.iter().sum();
-    exp.into_iter().map(|e| e / sum).collect()
+    Tensor::from_slice(&all_data)
 }
 
 // map actual legal moves to their canonical policy indices
@@ -266,7 +243,7 @@ pub fn extract_policy(bs: &BoardStack, contents: &'static [Move]) -> (Vec<Move>,
 // decode the network output and update the tree and cache
 
 pub fn process_board_output(
-    output: (&[f32], &[f32]),
+    output: (&Tensor, &Tensor),
     selected_node_idx: &usize,
     tree: &mut Tree,
     bs: &BoardStack,
@@ -274,9 +251,14 @@ pub fn process_board_output(
 ) -> Vec<usize> {
     let contents = get_contents();
 
-    let (board_evals, policy_values) = output;
+    let (board_eval, policy) = output;
 
     // decode the value head
+
+    let board_eval = board_eval.squeeze();
+
+    let board_evals: Vec<f32> =
+        Vec::try_from(board_eval).expect("Failed to convert board evaluation tensor");
 
     assert!(
         board_evals.len() >= 5,
@@ -286,7 +268,11 @@ pub fn process_board_output(
 
     let value = board_evals[0].tanh();
 
-    let wdl_values = softmax(&board_evals[1..4]);
+    let wdl_logits = Tensor::from_slice(&board_evals[1..4]);
+
+    let wdl_tensor = Tensor::softmax(&wdl_logits, 0, Kind::Float);
+
+    let wdl_values: Vec<f32> = Vec::try_from(wdl_tensor).expect("Failed to convert WDL tensor");
 
     let wdl = Wdl {
         w: wdl_values[0],
@@ -297,6 +283,10 @@ pub fn process_board_output(
     let moves_left = board_evals[4];
 
     // decode the policy head
+
+    let policy = policy.squeeze();
+
+    let policy_values: Vec<f32> = Vec::try_from(policy).expect("Failed to convert policy tensor");
 
     assert_eq!(
         policy_values.len(),
@@ -318,7 +308,12 @@ pub fn process_board_output(
 
     let pol_logits: Vec<f32> = idx_li.iter().map(|&idx| policy_values[idx]).collect();
 
-    let pol_list = softmax(&pol_logits);
+    let logits = Tensor::from_slice(&pol_logits);
+
+    let probabilities = Tensor::softmax(&logits, 0, Kind::Float);
+
+    let pol_list: Vec<f32> =
+        Vec::try_from(probabilities).expect("Failed to convert policy probabilities");
 
     assert_eq!(
         pol_list.len(),

@@ -18,14 +18,15 @@ use crate::{
         tests::{read_records, Record},
         BinaryOutput,
     },
-    mcts_trainer::{get_move_with_early_stop, EvalMode, Tree, TypeRequest, Wdl},
+    mcts_trainer::{EvalMode, Tree, TypeRequest, Wdl},
     mvs::get_contents,
     selfplay::{CollectorMessage, DataGen},
-    settings::{CPUCTSettings, FPUSettings, PSTSettings, PlayoutCapSettings, SearchSettings},
+    settings::{CPUCTSettings, FPUSettings, PSTSettings, SearchSettings},
 };
 use cozy_chess::{Board, Color, Move};
 use lru::LruCache;
 use std::num::NonZeroUsize;
+use tch::Tensor;
 
 // ---- the stub network ----------------------------------------------------------------------
 
@@ -95,11 +96,12 @@ fn spawn_stub(value: StubValue, policy: StubPolicy) -> flume::Sender<Packet> {
     let (send, recv) = flume::unbounded::<Packet>();
     std::thread::spawn(move || {
         for packet in recv.iter() {
-            let (head, logits) = stub_outputs(&packet.job, value, policy);
+            let input = Vec::<f32>::try_from(packet.job.reshape([-1])).unwrap();
+            let (head, logits) = stub_outputs(&input, value, policy);
             let _ = packet
                 .resender
                 .send(ReturnMessage::ReturnMessage(Ok(ReturnPacket {
-                    packet: (head.to_vec(), logits),
+                    packet: (Tensor::from_slice(&head), Tensor::from_slice(&logits)),
                     id: packet.id,
                 })));
         }
@@ -171,7 +173,7 @@ fn new_cache() -> LruCache<CacheEntryKey, ZeroEvaluationAbs> {
 }
 
 /// Deterministic search (no Dirichlet noise, no root PST) with the given stub, one leaf per
-/// step whatever `TZ_VIRTUAL_LEAVES` says.
+/// step whatever `VIRTUAL_LEAVES` says.
 fn search(fen: &str, nodes: u32, value: StubValue, policy: StubPolicy) -> Tree {
     search_k(fen, nodes, value, policy, 1)
 }
@@ -455,26 +457,19 @@ fn input_from_record(r: &Record) -> Vec<f32> {
 }
 
 fn play_selfplay_game(start: &str, nodes: u128, sender: &flume::Sender<Packet>) -> Simulation {
-    play_selfplay_game_with_cap(start, nodes, sender, None)
-}
-
-fn play_selfplay_game_with_cap(
-    start: &str,
-    nodes: u128,
-    sender: &flume::Sender<Packet>,
-    playout_cap: Option<PlayoutCapSettings>,
-) -> Simulation {
     let (nps_send, _nps_recv) = flume::unbounded::<CollectorMessage>();
     let mut cache = new_cache();
     let bs = BoardStack::new(Board::from_fen(start, false).unwrap());
     let settings = settings(TypeRequest::TrainerSearch(None), nodes);
-    futures::executor::block_on(
-        DataGen {
-            iterations: 1,
-            playout_cap,
-        }
-        .play_game(sender, &nps_send, &settings, 0, &mut cache, Some(bs), None),
-    )
+    futures::executor::block_on(DataGen { iterations: 1 }.play_game(
+        sender,
+        &nps_send,
+        &settings,
+        0,
+        &mut cache,
+        Some(bs),
+        None,
+    ))
 }
 
 /// R1-R7. Self-play with the constant stub, written by `BinaryOutput` and read back raw.
@@ -706,267 +701,9 @@ fn u1_go_nodes_sets_the_visit_limit() {
     assert_eq!(go_visit_limit(Some(5000), Color::Black, none, none, 30, Some(2000)), 200);
 }
 
-// ---- E, PCR: early stop and playout cap randomisation --------------------------------------
-
-/// E1. Early stopping returns the move a full search would play and never uses more visits.
-/// In a position with one clearly best move (mate in one, a hanging queen) it stops early.
-#[test]
-fn e1_early_stop_plays_the_full_search_move() {
-    let sender = spawn_stub(StubValue::Material, StubPolicy::Uniform);
-    let nodes = 400;
-    for (fen, decided) in [
-        ("6k1/5ppp/8/8/8/8/8/R5K1 w - - 0 1", true),
-        ("r5k1/8/8/8/8/8/5PPP/6K1 b - - 0 1", true),
-        ("4k3/8/8/3q4/8/8/3R4/4K3 w - - 0 1", true),
-        (
-            "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1",
-            false,
-        ),
-    ] {
-        // NonTrainerSearch adds no root noise, so both searches are deterministic.
-        let settings = settings(TypeRequest::NonTrainerSearch, nodes);
-        let run = |early_stop: bool| {
-            let bs = BoardStack::new(Board::from_fen(fen, false).unwrap());
-            let mut cache = new_cache();
-            futures::executor::block_on(get_move_with_early_stop(
-                bs, &sender, settings, 0, &mut cache, None, early_stop,
-            ))
-        };
-        let (full_mv, _, _, _, full_visits) = run(false);
-        let (early_mv, _, _, _, early_visits) = run(true);
-        assert_eq!(early_mv, full_mv, "{fen}");
-        assert_eq!(full_visits, nodes as u32, "{fen}");
-        assert!(early_visits <= full_visits, "{fen}");
-        if decided {
-            assert!(
-                early_visits < full_visits,
-                "{fen}: no early stop ({early_visits})"
-            );
-        }
-    }
-}
-
-/// E2. `root_move_decided` is exact: whenever it holds during a search, the most-visited
-/// root child at that moment is still the unique most-visited child at the end.
-#[test]
-fn e2_root_move_decided_never_changes_the_final_move() {
-    let sender = spawn_stub(StubValue::Material, StubPolicy::Marked);
-    let nodes = 300u32;
-    for fen in [
-        "4k3/8/8/3q4/8/8/3R4/4K3 w - - 0 1",
-        "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1",
-        "r1bqkbnr/pppp1ppp/2n5/4p3/4P3/5N2/PPPP1PPP/RNBQKB1R w KQkq - 2 3",
-    ] {
-        let bs = BoardStack::new(Board::from_fen(fen, false).unwrap());
-        let mut tree = Tree::new(bs, settings(TypeRequest::NonTrainerSearch, nodes as u128));
-        let mut cache = new_cache();
-        let sw = std::time::Instant::now();
-        let most_visited = |tree: &Tree| {
-            tree.nodes[0]
-                .children
-                .clone()
-                .max_by_key(|&c| tree.nodes[c].visits)
-                .unwrap()
-        };
-        let mut decided_at: Vec<usize> = vec![];
-        futures::executor::block_on(async {
-            while tree.nodes[0].visits < nodes {
-                if tree.nodes[0].visits >= 2 && tree.root_move_decided(nodes) {
-                    decided_at.push(most_visited(&tree));
-                }
-                tree.step(&sender, sw, 1, &mut cache).await;
-            }
-        });
-        let final_best = most_visited(&tree);
-        let best_visits = tree.nodes[final_best].visits;
-        let ties = tree.nodes[0]
-            .children
-            .clone()
-            .filter(|&c| tree.nodes[c].visits == best_visits)
-            .count();
-        for best in decided_at {
-            assert_eq!(best, final_best, "{fen}");
-            assert_eq!(ties, 1, "{fen}");
-        }
-    }
-}
-
-/// PCR1. A fast search uses the fast cap (never above the full cap) and no root noise; a
-/// full search uses the settings unchanged.
-#[test]
-fn pcr1_move_settings_for_full_and_fast_searches() {
-    let base = settings(TypeRequest::TrainerSearch(None), 800);
-    let cap = PlayoutCapSettings::new(0.25, 100, true);
-    assert_eq!(cap.move_settings(&base, true), base);
-    let fast = cap.move_settings(&base, false);
-    assert_eq!(fast.max_nodes, Some(100));
-    assert_eq!(fast.eps, 0.0);
-    assert_eq!(
-        SearchSettings {
-            max_nodes: Some(800),
-            eps: base.eps,
-            ..fast
-        },
-        base
-    );
-    let small = settings(TypeRequest::TrainerSearch(None), 50);
-    assert_eq!(cap.move_settings(&small, false).max_nodes, Some(50));
-}
-
-/// PCR2. In self-play, a move recorded with `is_full_search` used the full node count, and
-/// every other move used at most the fast cap. With p = 0 every move is fast, with p = 1
-/// every move is full, and in between both kinds appear. The flag is written to the file.
-#[test]
-fn pcr2_selfplay_records_full_and_fast_searches() {
-    let sender = spawn_stub(StubValue::Constant, StubPolicy::Uniform);
-    let start = "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1";
-    let (full_nodes, fast_visits) = (24u128, 6u32);
-    let check = |p: f32| {
-        let cap = PlayoutCapSettings::new(p, fast_visits, true);
-        let sim = play_selfplay_game_with_cap(start, full_nodes, &sender, Some(cap));
-        let full_count = sim.positions.iter().filter(|p| p.is_full_search).count();
-        for (i, pos) in sim.positions.iter().enumerate() {
-            if pos.is_full_search {
-                assert_eq!(pos.zero_visits, full_nodes as u64, "ply {i}");
-            } else {
-                assert!(pos.zero_visits <= fast_visits as u64, "ply {i}");
-                assert!(pos.zero_visits >= 2, "ply {i}");
-                // early stop only in the greedy phase; sampled moves use the whole fast cap
-                if i < crate::selfplay::TEMPERATURE_CUTOFF_PLIES {
-                    assert_eq!(pos.zero_visits, fast_visits as u64, "ply {i}");
-                }
-            }
-        }
-        (sim, full_count)
-    };
-
-    let (sim, full) = check(0.0);
-    assert_eq!(full, 0);
-    assert!(!sim.positions.is_empty());
-    let (sim, full) = check(1.0);
-    assert_eq!(full, sim.positions.len());
-    let (sim, full) = check(0.5);
-    assert!(sim.positions.len() >= 20, "game too short to test mixing");
-    assert!(
-        full > 0 && full < sim.positions.len(),
-        "{full} of {}",
-        sim.positions.len()
-    );
-
-    let path = std::env::temp_dir().join(format!("tzrust-pcr-{}", std::process::id()));
-    let mut out = BinaryOutput::new(&path, "chess").unwrap();
-    out.append(&sim).unwrap();
-    out.finish().unwrap();
-    let (records, _, _) = read_records(&path);
-    for ext in ["bin", "off", "json"] {
-        let _ = std::fs::remove_file(path.with_extension(ext));
-    }
-    for (pos, rec) in sim.positions.iter().zip(&records) {
-        // scalars: [game_id, pos_index, game_length, zero_visits, is_full_search, ...]
-        assert_eq!(rec.scalars[3], pos.zero_visits as f32);
-        assert_eq!(rec.scalars[4], pos.is_full_search as u8 as f32);
-    }
-}
-
-// ---- executor batch path -------------------------------------------------------------------
-
-/// X1: the executor's batch path (reused input buffer, one bulk copy of each output, per-request
-/// slices) hands every request exactly the outputs of its own position, across several batches
-/// that reuse the same buffers, including a partial final batch. Compared with evaluating each
-/// position on its own through `eval_state`, using a real TorchScript network on the CPU.
-#[test]
-fn x1_executor_returns_each_request_its_own_outputs() {
-    check_executor_returns_each_request_its_own_outputs(false);
-}
-
-/// X2: X1 with pull batching (`TZ_BATCH_TIMEOUT_US=0`), where the executor gathers each batch
-/// itself from the queue when it is free. The requests are queued before the network is sent, so
-/// the first batches are full (4) and the last one partial (2).
-#[test]
-fn x2_pull_batching_returns_each_request_its_own_outputs() {
-    check_executor_returns_each_request_its_own_outputs(true);
-}
-
-fn check_executor_returns_each_request_its_own_outputs(pull: bool) {
-    use crate::decoder::{board_input, eval_state};
-    use crate::executor::run_executor;
-    use crate::mcts_trainer::Net;
-
-    let net_path = concat!(env!("CARGO_MANIFEST_DIR"), "/../python/nets/tz_6515.pt");
-
-    // 10 distinct positions along one game
-    let mut bs = BoardStack::new(Board::default());
-    let mut positions = vec![bs.clone()];
-    while positions.len() < 10 {
-        let mut moves = Vec::new();
-        bs.board().generate_moves(|m| {
-            moves.extend(m);
-            false
-        });
-        bs.play(moves[positions.len() % moves.len()]);
-        positions.push(bs.clone());
-    }
-
-    let net = Net::new(net_path);
-    let expected: Vec<(Vec<f32>, Vec<f32>)> = positions
-        .iter()
-        .map(|p| {
-            let (v, pol) = eval_state(convert_board(p), &net).unwrap();
-            (
-                Vec::try_from(v.reshape([-1])).unwrap(),
-                Vec::try_from(pol.reshape([-1])).unwrap(),
-            )
-        })
-        .collect();
-
-    let (net_send, net_recv) = flume::unbounded::<String>();
-    let (job_send, job_recv) = flume::unbounded::<Packet>();
-    // batches of at most 4, so 10 requests need at least 3 batches through the same buffers
-    std::thread::spawn(move || run_executor(net_recv, job_recv, 4, None, None, 0, pull));
-
-    let receivers: Vec<_> = positions
-        .iter()
-        .enumerate()
-        .map(|(i, p)| {
-            let (tx, rx) = flume::bounded(1);
-            job_send
-                .send(Packet {
-                    job: board_input(p),
-                    resender: tx,
-                    id: format!("request-{i}"),
-                })
-                .unwrap();
-            rx
-        })
-        .collect();
-    net_send.send(net_path.to_string()).unwrap();
-
-    for (i, (rx, (value, policy))) in receivers.iter().zip(&expected).enumerate() {
-        let ReturnMessage::ReturnMessage(reply) = rx
-            .recv_timeout(std::time::Duration::from_secs(60))
-            .expect("executor did not answer");
-        let reply = reply.unwrap();
-        assert_eq!(reply.id, format!("request-{i}"));
-        let (got_value, got_policy) = reply.packet;
-        assert_eq!(got_value.len(), value.len());
-        assert_eq!(got_policy.len(), policy.len());
-        let max_diff = got_value
-            .iter()
-            .zip(value)
-            .chain(got_policy.iter().zip(policy))
-            .map(|(a, b)| (a - b).abs())
-            .fold(0.0_f32, f32::max);
-        assert!(max_diff < 1e-4, "request {i}: outputs differ by {max_diff}");
-    }
-
-    // the executor exits the process once its channels close, so keep them open
-    std::mem::forget(net_send);
-    std::mem::forget(job_send);
-}
-
 // ---- V: virtual-loss leaf batching ---------------------------------------------------------
 //
-// `Tree::step` gathers up to k = `Tree::virtual_leaves` (`TZ_VIRTUAL_LEAVES`) leaves per step.
+// `Tree::step` gathers up to k = `Tree::virtual_leaves` (`VIRTUAL_LEAVES`) leaves per step.
 // Invariants:
 //   V1  k = 1 builds exactly the tree the sequential search built before batching existed.
 //   V2  After every step no node has a virtual visit; the root gains exactly one real visit
@@ -1005,14 +742,15 @@ fn tree_fingerprint(tree: &Tree) -> u64 {
     h
 }
 
-/// V1. Fingerprints recorded from the sequential search on main (7deebc1) before this change.
+/// V1. Fingerprints recorded from the sequential search before virtual loss was added, on the
+/// PR #38 tree plus the uv migration and UCI score commits (06a57f2).
 #[test]
 fn v1_one_leaf_per_step_reproduces_the_sequential_search() {
     let expected: [(u64, usize); 4] = [
-        (0x40b1_95ee_1160_a8d2, 10020),
-        (0x3d20_11a1_9c00_53a4, 10393),
-        (0xdfa7_414c_8189_3090, 8886),
-        (0xd245_0f9d_b170_369e, 8886),
+        (0xac90_dd71_4d59_6cdb, 10020),
+        (0x5c15_cb30_a7e8_3496, 10393),
+        (0x324b_9872_dcbd_a767, 8886),
+        (0xaa80_0657_323c_3786, 8886),
     ];
     for (fen, (fp, len)) in SEARCH_FENS.iter().zip(expected) {
         let tree = search(fen, 300, StubValue::Material, StubPolicy::Marked);

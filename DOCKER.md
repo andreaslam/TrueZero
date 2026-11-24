@@ -92,15 +92,6 @@ The following variables are runtime configuration and do not require rebuilding:
 | `TZ_DEVICE` | `auto` in the image, `cuda` in Compose | `auto`, `cpu`, `cuda`, or `mps` |
 | `TZ_COMMAND` | `ucimain` | Rust binary to execute |
 
-Training settings (self-play, search, trainer, executors, port) are not environment
-variables: they live in `truezero.toml` in the repository (see `truezero.example.toml`;
-an image without one uses the example's defaults). The old `TZ_NUM_GENERATORS`,
-`TZ_VIRTUAL_LEAVES`, `TZ_PCR_*`, `TZ_LR_*`, `TZ_NUM_EXECUTORS`, `TZ_BATCH_TIMEOUT_US` and
-`TZ_SERVER_PORT` variables are ignored with a warning. With `TZ_DATA_ROOT` set (as here),
-`/data` is the run's folder and `server reset` is refused. The image records the commit it was built from
-(`--build-arg TZ_BUILD_GIT_SHA=$(git rev-parse HEAD)`; CI passes it), which each run records in its `run.json`. See
-"Settings and runs" in the README.
-
 `TZ_DEVICE=cuda` fails explicitly if CUDA is unavailable. `auto` selects CUDA,
 then Apple MPS, then CPU. `TZ_DATA_ROOT` is honored by both Rust and Python,
 so checkpoints, game data, logs, and experiment outputs survive image updates.
