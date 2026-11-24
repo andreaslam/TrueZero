@@ -170,10 +170,17 @@ fn new_cache() -> LruCache<CacheEntryKey, ZeroEvaluationAbs> {
     LruCache::new(NonZeroUsize::new(100_000).unwrap())
 }
 
-/// Deterministic search (no Dirichlet noise, no root PST) with the given stub.
+/// Deterministic search (no Dirichlet noise, no root PST) with the given stub, one leaf per
+/// step whatever `TZ_VIRTUAL_LEAVES` says.
 fn search(fen: &str, nodes: u32, value: StubValue, policy: StubPolicy) -> Tree {
+    search_k(fen, nodes, value, policy, 1)
+}
+
+/// `search` gathering up to `k` leaves per step (virtual-loss leaf batching).
+fn search_k(fen: &str, nodes: u32, value: StubValue, policy: StubPolicy, k: usize) -> Tree {
     let bs = BoardStack::new(Board::from_fen(fen, false).unwrap());
     let mut tree = Tree::new(bs, settings(TypeRequest::NonTrainerSearch, nodes as u128));
+    tree.virtual_leaves = k;
     let sender = spawn_stub(value, policy);
     let mut cache = new_cache();
     let sw = std::time::Instant::now();
@@ -227,13 +234,13 @@ const SEARCH_FENS: [&str; 4] = [
 
 // ---- S: perspective and sign ---------------------------------------------------------------
 
-/// S1. The network's output is from the side to move's point of view, and the tree stores
+/// S1 (with 1 and 8 leaves per step). The network's output is from the side to move's point of view, and the tree stores
 /// it in absolute (White) terms: `net_evaluation.to_relative(stm)` of every expanded node
 /// equals the stub's output for that node's own position.
 #[test]
 fn s1_tree_stores_the_side_to_move_net_output_as_absolute() {
-    for fen in SEARCH_FENS {
-        let tree = search(fen, 300, StubValue::Material, StubPolicy::Uniform);
+    for (fen, k) in SEARCH_FENS.iter().flat_map(|f| [(*f, 1), (*f, 8)]) {
+        let tree = search_k(fen, 300, StubValue::Material, StubPolicy::Uniform, k);
         let mut checked = 0;
         for node in 0..tree.nodes.len() {
             if tree.nodes[node].visits == 0 {
@@ -275,16 +282,19 @@ fn s2_terminal_nodes_are_scored_by_the_winner() {
     }
 }
 
-/// S3. With a material-only evaluator and a uniform prior, the search must win a hanging
+/// S3 (with 1 and 8 leaves per step). With a material-only evaluator and a uniform prior, the search must win a hanging
 /// queen, for White and for Black, and report a positive root Q for the side to move.
 /// A sign error anywhere between net output, backup and PUCT turns this into avoiding it.
 #[test]
 fn s3_search_wins_a_hanging_queen_for_either_colour() {
-    for (fen, capture) in [
+    for (fen, capture, k) in [
         ("4k3/8/8/3q4/8/8/3R4/4K3 w - - 0 1", "d2d5"),
         ("4k3/3r4/8/8/3Q4/8/8/4K3 b - - 0 1", "d7d4"),
-    ] {
-        let tree = search(fen, 400, StubValue::Material, StubPolicy::Uniform);
+    ]
+    .iter()
+    .flat_map(|&(f, c)| [(f, c, 1), (f, c, 8)])
+    {
+        let tree = search_k(fen, 400, StubValue::Material, StubPolicy::Uniform, k);
         let capture: Move = capture.parse().unwrap();
         let best = tree.nodes[0]
             .children
@@ -302,14 +312,14 @@ fn s3_search_wins_a_hanging_queen_for_either_colour() {
 
 // ---- B: backup -----------------------------------------------------------------------------
 
-/// B1. Backup adds absolute values with no sign change. For every node:
+/// B1 (with 1 and 8 leaves per step). Backup adds absolute values with no sign change. For every node:
 ///   visits = own + sum(child visits), with own >= 1 once visited
 ///   total  = own * net_evaluation + sum(child totals)            (value and WDL)
 ///   total.moves_left = own * net.moves_left + sum(child total.moves_left + child visits)
 #[test]
 fn b1_backup_conserves_visits_and_values() {
-    for fen in SEARCH_FENS {
-        let tree = search(fen, 300, StubValue::Material, StubPolicy::Uniform);
+    for (fen, k) in SEARCH_FENS.iter().flat_map(|f| [(*f, 1), (*f, 8)]) {
+        let tree = search_k(fen, 300, StubValue::Material, StubPolicy::Uniform, k);
         for (i, node) in tree.nodes.iter().enumerate() {
             if node.visits == 0 {
                 continue;
@@ -952,4 +962,228 @@ fn check_executor_returns_each_request_its_own_outputs(pull: bool) {
     // the executor exits the process once its channels close, so keep them open
     std::mem::forget(net_send);
     std::mem::forget(job_send);
+}
+
+// ---- V: virtual-loss leaf batching ---------------------------------------------------------
+//
+// `Tree::step` gathers up to k = `Tree::virtual_leaves` (`TZ_VIRTUAL_LEAVES`) leaves per step.
+// Invariants:
+//   V1  k = 1 builds exactly the tree the sequential search built before batching existed.
+//   V2  After every step no node has a virtual visit; the root gains exactly one real visit
+//       per descent that was not a collision (terminal and cache-hit leaves included), which
+//       is between 1 and k, and never passes the node limit. For every node with children,
+//       visits = 1 + sum of the children's visits.
+//   V3  Mid-step, the virtual visits of any node with children equal the sum of its
+//       children's, the root holds one per pending leaf, and removing them restores the tree.
+//   V4  A virtual visit is a loss for the side choosing the move, in that side's frame:
+//       Q = (W_pov - vv) / (N + vv), at White- and Black-to-move parents alike. Real totals
+//       (stored White-absolute) are untouched.
+// S1, S3 and B1 also run with k = 8.
+
+/// FNV-1a over every node's parent, move, visits, prior and value totals (bit-exact).
+fn tree_fingerprint(tree: &Tree) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    let mut eat = |x: u64| {
+        for b in x.to_le_bytes() {
+            h ^= b as u64;
+            h = h.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+    };
+    for node in &tree.nodes {
+        eat(node.parent.map_or(u64::MAX, |p| p as u64));
+        eat(node.mv.map_or(u64::MAX, |m| {
+            let s = format!("{m}");
+            s.bytes().fold(0u64, |a, b| a * 131 + b as u64)
+        }));
+        eat(node.visits as u64);
+        eat(node.policy.to_bits() as u64);
+        let t = node.total_evaluation;
+        for v in [t.value, t.wdl.w, t.wdl.d, t.wdl.l, t.moves_left] {
+            eat(v.to_bits() as u64);
+        }
+    }
+    h
+}
+
+/// V1. Fingerprints recorded from the sequential search on main (7deebc1) before this change.
+#[test]
+fn v1_one_leaf_per_step_reproduces_the_sequential_search() {
+    let expected: [(u64, usize); 4] = [
+        (0x40b1_95ee_1160_a8d2, 10020),
+        (0x3d20_11a1_9c00_53a4, 10393),
+        (0xdfa7_414c_8189_3090, 8886),
+        (0xd245_0f9d_b170_369e, 8886),
+    ];
+    for (fen, (fp, len)) in SEARCH_FENS.iter().zip(expected) {
+        let tree = search(fen, 300, StubValue::Material, StubPolicy::Marked);
+        assert_eq!(tree.nodes.len(), len, "{fen}");
+        assert_eq!(tree_fingerprint(&tree), fp, "{fen}");
+    }
+}
+
+/// V2. Step-by-step bookkeeping with several leaves per step. The node limit (300) is not a
+/// multiple of most k, so the last step must be cut short to land on it exactly.
+#[test]
+fn v2_batched_steps_leave_no_virtual_visits_and_count_real_visits() {
+    let nodes = 300;
+    for fen in SEARCH_FENS
+        .iter()
+        .chain(["6k1/5ppp/8/8/8/8/8/R5K1 w - - 0 1"].iter())
+    {
+        for k in [2, 8, 32] {
+            let bs = BoardStack::new(Board::from_fen(fen, false).unwrap());
+            let mut tree = Tree::new(bs, settings(TypeRequest::NonTrainerSearch, nodes as u128));
+            tree.virtual_leaves = k;
+            let sender = spawn_stub(StubValue::Material, StubPolicy::Uniform);
+            let mut cache = new_cache();
+            let sw = std::time::Instant::now();
+            let mut collisions = 0;
+            futures::executor::block_on(async {
+                while tree.nodes[0].visits < nodes {
+                    let before = tree.nodes[0].visits;
+                    let stats = tree.step(&sender, sw, 1, &mut cache).await;
+                    let gained = tree.nodes[0].visits - before;
+                    assert!(stats.descents <= k, "{fen} k={k}: {stats:?}");
+                    assert_eq!(
+                        gained as usize,
+                        stats.descents - stats.collisions,
+                        "{fen} k={k}: {stats:?}"
+                    );
+                    assert!(gained >= 1, "{fen} k={k}: a step made no progress");
+                    assert!(
+                        tree.nodes[0].visits <= nodes,
+                        "{fen} k={k}: passed the limit"
+                    );
+                    for (i, node) in tree.nodes.iter().enumerate() {
+                        assert_eq!(node.virtual_visits, 0, "{fen} k={k}: node {i}");
+                    }
+                    collisions += stats.collisions;
+                }
+            });
+            assert_eq!(tree.nodes[0].visits, nodes, "{fen} k={k}");
+            for (i, node) in tree.nodes.iter().enumerate() {
+                if node.children.is_empty() {
+                    continue;
+                }
+                let child_visits: u32 = node.children.clone().map(|c| tree.nodes[c].visits).sum();
+                assert_eq!(node.visits, 1 + child_visits, "{fen} k={k}: node {i}");
+            }
+            // the first step of every search expands only the root: the other k - 1
+            // descents all reach the pending root
+            assert!(collisions >= k - 1, "{fen} k={k}: {collisions} collisions");
+        }
+    }
+}
+
+/// V3. Virtual visits mid-step, using the same select / add / remove calls as `Tree::step`.
+#[test]
+fn v3_virtual_visits_are_consistent_mid_step() {
+    for fen in SEARCH_FENS {
+        let mut tree = search(fen, 200, StubValue::Material, StubPolicy::Uniform);
+        let fingerprint = tree_fingerprint(&tree);
+        let mut pending: Vec<usize> = vec![];
+        for _ in 0..16 {
+            let (leaf, bs, _) = tree.select();
+            if bs.is_terminal() || tree.nodes[leaf].virtual_visits > 0 {
+                continue;
+            }
+            tree.add_virtual_visit(leaf);
+            pending.push(leaf);
+
+            assert_eq!(
+                tree.nodes[0].virtual_visits as usize,
+                pending.len(),
+                "{fen}"
+            );
+            for (i, node) in tree.nodes.iter().enumerate() {
+                if node.children.is_empty() {
+                    continue;
+                }
+                let sum: u32 = node
+                    .children
+                    .clone()
+                    .map(|c| tree.nodes[c].virtual_visits)
+                    .sum();
+                assert_eq!(node.virtual_visits, sum, "{fen}: node {i}");
+            }
+            for (i, node) in tree.nodes.iter().enumerate() {
+                if node.children.is_empty() && node.visits == 0 {
+                    // an unexpanded leaf is pending at most once
+                    assert!(node.virtual_visits <= 1, "{fen}: node {i}");
+                }
+            }
+        }
+        assert!(
+            pending.len() > 4,
+            "{fen}: virtual loss should spread the descents"
+        );
+        let distinct: std::collections::HashSet<_> = pending.iter().collect();
+        assert_eq!(distinct.len(), pending.len(), "{fen}");
+
+        for leaf in pending {
+            tree.remove_virtual_visit(leaf);
+        }
+        assert!(tree.nodes.iter().all(|n| n.virtual_visits == 0), "{fen}");
+        assert_eq!(tree_fingerprint(&tree), fingerprint, "{fen}");
+    }
+}
+
+/// V4. Virtual loss is a loss for the player choosing the move, at either colour's turn.
+#[test]
+fn v4_virtual_loss_is_a_loss_for_the_side_choosing_the_move() {
+    for fen in SEARCH_FENS {
+        let mut tree = search(fen, 200, StubValue::Material, StubPolicy::Uniform);
+        let stm = tree.board.board().side_to_move();
+        let s = tree.settings;
+        let child = tree.nodes[0]
+            .children
+            .clone()
+            .find(|&c| tree.nodes[c].visits > 2)
+            .expect("a visited root child");
+        let totals = |t: &Tree| {
+            let e = t.nodes[child].total_evaluation;
+            [e.value, e.wdl.w, e.wdl.d, e.wdl.l, e.moves_left].map(f32::to_bits)
+        };
+        let total_before = totals(&tree);
+
+        // W - L of the child from the side to move at the root, recomputed from the stored
+        // White-absolute totals without `to_relative`
+        let abs = tree.nodes[child].total_evaluation.wdl;
+        let w_pov = match stm {
+            Color::White => abs.w - abs.l,
+            Color::Black => abs.l - abs.w,
+        };
+        let n = tree.nodes[child].visits as f32;
+        let rel = tree.nodes[child].total_evaluation.to_relative(stm);
+        let q0 = tree.nodes[child].get_q_val(s, rel);
+        assert!(close(q0, w_pov / n, 1e-5), "{fen}: {q0} vs {}", w_pov / n);
+        let parent_n = tree.nodes[0].visits;
+        let puct0 = tree.nodes[child].puct_formula(parent_n, 0.0, stm, s);
+
+        for vv in 1..=3u32 {
+            tree.add_virtual_visit(child);
+            let rel = tree.nodes[child].total_evaluation.to_relative(stm);
+            let q = tree.nodes[child].get_q_val(s, rel);
+            let expected = (w_pov - vv as f32) / (n + vv as f32);
+            assert!(
+                close(q, expected, 1e-5),
+                "{fen} vv={vv}: Q {q}, expected {expected}"
+            );
+            assert!(q < q0, "{fen} vv={vv}: virtual loss raised Q for {stm:?}");
+            let puct = tree.nodes[child].puct_formula(
+                tree.nodes[0].visits + tree.nodes[0].virtual_visits,
+                0.0,
+                stm,
+                s,
+            );
+            assert!(
+                puct < puct0,
+                "{fen} vv={vv}: virtual loss raised PUCT for {stm:?}"
+            );
+            assert_eq!(totals(&tree), total_before, "{fen}");
+        }
+        for _ in 1..=3 {
+            tree.remove_virtual_visit(child);
+        }
+    }
 }

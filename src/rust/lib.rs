@@ -462,6 +462,8 @@ mod tests {
         // the network must never be consulted for a terminal node: no executor behind this
         let (sender, _recv) = flume::unbounded::<Packet>();
         let mut cache = new_cache();
+        // one descent per step, so one step is one visit whatever TZ_VIRTUAL_LEAVES says
+        tree.virtual_leaves = 1;
         futures::executor::block_on(tree.step(&sender, std::time::Instant::now(), 1, &mut cache));
 
         assert_eq!(tree.nodes[0].visits, 1);

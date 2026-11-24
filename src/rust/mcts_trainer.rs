@@ -113,6 +113,14 @@ impl Net {
     }
 }
 
+/// What one `Tree::step` did: `descents` selections, of which `collisions` reached a leaf
+/// already pending in the same step and were dropped. Each other descent adds one real visit.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct StepStats {
+    pub descents: usize,
+    pub collisions: usize,
+}
+
 #[derive(Debug)]
 pub struct Tree {
     pub board: BoardStack,
@@ -120,6 +128,30 @@ pub struct Tree {
     pub settings: SearchSettings,
     pub pv: String,
     pub root_net_policy: Option<Vec<f32>>,
+    /// leaves gathered per `step` (virtual-loss leaf batching); 1 is plain sequential MCTS.
+    /// Set from `TZ_VIRTUAL_LEAVES` by `Tree::new`.
+    pub virtual_leaves: usize,
+}
+
+/// Leaves each search gathers per `Tree::step` before waiting for their evaluations, from
+/// `TZ_VIRTUAL_LEAVES` (default 1, i.e. plain sequential MCTS). Read once per process.
+pub fn virtual_leaves_from_env() -> usize {
+    static VIRTUAL_LEAVES: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *VIRTUAL_LEAVES.get_or_init(|| match std::env::var("TZ_VIRTUAL_LEAVES") {
+        Ok(value) => match value.trim().parse::<usize>() {
+            Ok(k) if k >= 1 => k,
+            _ => panic!("TZ_VIRTUAL_LEAVES must be a whole number >= 1, got {value:?}"),
+        },
+        Err(_) => 1,
+    })
+}
+
+/// name of the current generator thread, used to check each evaluation comes back to its sender
+fn generator_thread_name() -> String {
+    std::thread::current()
+        .name()
+        .unwrap_or("unnamed-generator")
+        .to_owned()
 }
 
 impl Tree {
@@ -135,156 +167,120 @@ impl Tree {
             settings,
             pv,
             root_net_policy: None,
+            virtual_leaves: virtual_leaves_from_env(),
         }
     }
 
-    /// executes one iteration of MCTS (selection, expansion, evaluation and backpropagation)
-
+    /// executes one round of MCTS: up to `virtual_leaves` descents (selection), then one
+    /// network evaluation per new leaf, expansion and backpropagation.
+    ///
+    /// With `virtual_leaves == 1` this is plain sequential MCTS. With k > 1 each descent adds a
+    /// virtual visit along its path, so the next descent sees the pending leaf as a loss for the
+    /// side that chose it and tends to pick a different leaf (Lc0/kZero leaf batching). All
+    /// pending leaves of the round are sent to the executor together, so one game keeps up to k
+    /// evaluations in flight. Every round makes at least one real visit: the first descent
+    /// starts with no virtual visits anywhere, so it can never be a collision.
     pub async fn step(
         &mut self,
         tensor_exe_send: &Sender<Packet>, // sender to send tensors to `executor.rs`, which gathers MCTS simulations to execute in a batch
         sw: Instant,                      // timer for UCI
         id: usize,                        // unique ID assigned to each thread for debugging
         cache: &mut LruCache<CacheEntryKey, ZeroEvaluationAbs>,
-    ) {
+    ) -> StepStats {
         let thread_name = format!("generator-{}", id);
+        let mut stats = StepStats::default();
         let step_debugger = TimeStampDebugger::create_debug();
 
-        let (selected_node, input_b, (min_depth, max_depth)) = self.select();
+        // never search past the node limit: a round of k descents could otherwise overshoot it
+        let descents = match self.settings.max_nodes {
+            Some(max_nodes) => {
+                let left = (max_nodes as u64).saturating_sub(self.nodes[0].visits as u64);
+                (self.virtual_leaves as u64).min(left).max(1) as usize
+            }
+            None => self.virtual_leaves,
+        };
 
-        if id % 512 == 0 {
-            step_debugger.record("mcts select", &thread_name);
-        }
+        let mut pending: Vec<(usize, BoardStack, Receiver<ReturnMessage>)> = Vec::new();
+        let mut depths = (0, 0);
 
-        // self.nodes[0].display_full_tree(self);
+        for _ in 0..descents {
+            let (selected_node, input_b, d) = self.select();
+            depths = d;
+            stats.descents += 1;
 
-        let idx_li: Vec<usize>;
+            if id % 512 == 0 {
+                step_debugger.record("mcts select", &thread_name);
+            }
 
-        // check if the board has reached terminal state in selection
+            if input_b.is_terminal() {
+                // terminal leaves need no evaluation: score and back up now
+                self.score_terminal(selected_node, &input_b);
+                self.backpropagate(selected_node);
+                continue;
+            }
 
-        if !input_b.is_terminal() {
+            if self.nodes[selected_node].virtual_visits > 0 {
+                // collision: this leaf is already waiting for its evaluation in this round.
+                // Drop the descent (Lc0 style) rather than evaluate or count it twice.
+                stats.collisions += 1;
+                continue;
+            }
+
             // check whether board position is in cache
-
             let cache_key = CacheEntryKey {
                 hash: input_b.board().hash(),
                 halfmove_clock: input_b.board().halfmove_clock(),
                 repetitions: input_b.get_reps() as u8,
             };
 
-            idx_li = match cache.get(&cache_key) {
-                Some(packet) => {
-                    // retrieve non-policy data
-                    let ct = self.nodes.len();
-                    self.nodes[selected_node].net_evaluation = packet.values;
-                    if selected_node == 0 {
-                        self.root_net_policy = Some(packet.policy.clone());
-                    }
-                    // retrieve policy data and children
-
-                    let contents = get_contents(); // this extracts the mapping for policy nodes according to `mvs.rs`
-                    let (_, idx_li) = extract_policy(&input_b, contents); // filters the correct indices of policy nodes according to current board legal moves
-                    let mut legal_moves: Vec<Move> = Vec::new();
-                    input_b.board().generate_moves(|moves| {
-                        legal_moves.extend(moves);
-                        false
-                    });
-
-                    let mut counter = 0;
-
-                    for mv in legal_moves {
-                        let pol = packet.policy[counter];
-                        let new_child = Node::new(pol, Some(selected_node), Some(mv));
-                        self.nodes.push(new_child); // push child to the tree Vec<Node>
-                        counter += 1;
-                    }
-                    self.nodes[selected_node].children = ct..ct + counter; // push indices of `Node.children` (type `Range<usize>`)
-
-                    idx_li // returns idx_li, which is used for indexing legal moves
+            if let Some(packet) = cache.get(&cache_key) {
+                // retrieve non-policy data
+                let ct = self.nodes.len();
+                self.nodes[selected_node].net_evaluation = packet.values;
+                if selected_node == 0 {
+                    self.root_net_policy = Some(packet.policy.clone());
                 }
-                None => {
-                    self.eval_and_expand(&selected_node, &input_b, tensor_exe_send, id, cache)
-                        .await // if there are no corresponding entries in the cache, request a nn evaluation
-                }
-            };
-            if selected_node != 0 {
-                let mut sum = 0.0;
+                // retrieve policy data and children
 
-                for child in self.nodes[selected_node].children.clone() {
-                    self.nodes[child].policy = self.nodes[child]
-                        .policy
-                        .powf(self.settings.pst.children_pst);
-                    sum += self.nodes[child].policy;
-                }
-
-                for child in self.nodes[selected_node].children.clone() {
-                    self.nodes[child].policy /= sum;
-                }
-            }
-            debug_assert!(self.nodes[selected_node]
-                .children
-                .clone()
-                .all(|child| self.nodes[child].policy.is_finite()));
-            self.nodes[selected_node].move_idx = Some(idx_li);
-            let mut legal_moves: Vec<Move>;
-            if selected_node == 0 {
-                legal_moves = Vec::new();
-                self.board.board().generate_moves(|moves| {
+                let contents = get_contents(); // this extracts the mapping for policy nodes according to `mvs.rs`
+                let (_, idx_li) = extract_policy(&input_b, contents); // filters the correct indices of policy nodes according to current board legal moves
+                let mut legal_moves: Vec<Move> = Vec::new();
+                input_b.board().generate_moves(|moves| {
                     legal_moves.extend(moves);
                     false
                 });
-                // add policy softmax temperature and Dirichlet noise
-                if let TypeRequest::TrainerSearch(_) = self.settings.search_type {
-                    let mut sum = 0.0;
-                    for child in self.nodes[0].children.clone() {
-                        self.nodes[child].policy =
-                            self.nodes[child].policy.powf(self.settings.pst.root_pst);
-                        sum += self.nodes[child].policy;
-                    }
-                    for child in self.nodes[0].children.clone() {
-                        self.nodes[child].policy /= sum;
-                    }
-                    let mut std_rng = StdRng::from_entropy();
-                    let distr = StableDirichlet::new(self.settings.alpha, legal_moves.len())
-                        .expect("wrong params");
-                    let sample = std_rng.sample(distr);
-                    for child in self.nodes[0].children.clone() {
-                        self.nodes[child].policy = (1.0 - self.settings.eps)
-                            * self.nodes[child].policy
-                            + (self.settings.eps * sample[child - 1]);
-                    }
+
+                let mut counter = 0;
+
+                for mv in legal_moves {
+                    let pol = packet.policy[counter];
+                    let new_child = Node::new(pol, Some(selected_node), Some(mv));
+                    self.nodes.push(new_child); // push child to the tree Vec<Node>
+                    counter += 1;
                 }
+                self.nodes[selected_node].children = ct..ct + counter; // push indices of `Node.children` (type `Range<usize>`)
+
+                self.finish_expansion(selected_node, idx_li);
+                self.backpropagate(selected_node);
+                continue;
             }
-        } else {
-            // handle terminal nodes - value and WDL assignment
-            let wdl = match input_b.status() {
-                GameStatus::Drawn => Wdl {
-                    w: 0.0,
-                    d: 1.0,
-                    l: 0.0,
-                },
-                GameStatus::Won => match !input_b.board().side_to_move() {
-                    Color::White => Wdl {
-                        w: 1.0,
-                        d: 0.0,
-                        l: 0.0,
-                    },
-                    Color::Black => Wdl {
-                        w: 0.0,
-                        d: 0.0,
-                        l: 1.0,
-                    },
-                },
-                GameStatus::Ongoing => {
-                    unreachable!()
-                }
-            };
-            debug_print!("terminal! {:#} {:?}", input_b.board(), wdl);
-            self.nodes[selected_node].net_evaluation.value = wdl.w - wdl.l;
-            self.nodes[selected_node].net_evaluation.wdl = wdl;
-            self.nodes[selected_node].net_evaluation.moves_left = 0.0;
+
+            // needs a network evaluation: queue it and mark the path as pending
+            let receiver = self.send_for_eval(&input_b, tensor_exe_send).await;
+            self.add_virtual_visit(selected_node);
+            pending.push((selected_node, input_b, receiver));
         }
 
-        self.backpropagate(selected_node);
+        for (selected_node, input_b, receiver) in pending {
+            let idx_li = self
+                .receive_and_expand(selected_node, &input_b, receiver, cache)
+                .await;
+            self.finish_expansion(selected_node, idx_li);
+            self.remove_virtual_visit(selected_node);
+            self.backpropagate(selected_node);
+        }
+        let (min_depth, max_depth) = depths;
+
         let backprop_debug = TimeStampDebugger::create_debug();
         if id % 512 == 0 {
             backprop_debug.record("backpropagation", &thread_name);
@@ -341,6 +337,106 @@ impl Tree {
                 );
                 self.pv = pv;
             }
+        }
+        stats
+    }
+
+    /// policy temperature (and, at the root of a training search, Dirichlet noise) for a node
+    /// whose children were just created, plus its policy-index list
+    fn finish_expansion(&mut self, selected_node: usize, idx_li: Vec<usize>) {
+        if selected_node != 0 {
+            let mut sum = 0.0;
+
+            for child in self.nodes[selected_node].children.clone() {
+                self.nodes[child].policy = self.nodes[child]
+                    .policy
+                    .powf(self.settings.pst.children_pst);
+                sum += self.nodes[child].policy;
+            }
+
+            for child in self.nodes[selected_node].children.clone() {
+                self.nodes[child].policy /= sum;
+            }
+        }
+        debug_assert!(self.nodes[selected_node]
+            .children
+            .clone()
+            .all(|child| self.nodes[child].policy.is_finite()));
+        self.nodes[selected_node].move_idx = Some(idx_li);
+        if selected_node == 0 {
+            // add policy softmax temperature and Dirichlet noise
+            if let TypeRequest::TrainerSearch(_) = self.settings.search_type {
+                let mut sum = 0.0;
+                for child in self.nodes[0].children.clone() {
+                    self.nodes[child].policy =
+                        self.nodes[child].policy.powf(self.settings.pst.root_pst);
+                    sum += self.nodes[child].policy;
+                }
+                for child in self.nodes[0].children.clone() {
+                    self.nodes[child].policy /= sum;
+                }
+                let mut std_rng = StdRng::from_entropy();
+                let distr = StableDirichlet::new(self.settings.alpha, self.nodes[0].children.len())
+                    .expect("wrong params");
+                let sample = std_rng.sample(distr);
+                for child in self.nodes[0].children.clone() {
+                    self.nodes[child].policy = (1.0 - self.settings.eps) * self.nodes[child].policy
+                        + (self.settings.eps * sample[child - 1]);
+                }
+            }
+        }
+    }
+
+    /// handle terminal nodes - value and WDL assignment
+    fn score_terminal(&mut self, selected_node: usize, input_b: &BoardStack) {
+        let wdl = match input_b.status() {
+            GameStatus::Drawn => Wdl {
+                w: 0.0,
+                d: 1.0,
+                l: 0.0,
+            },
+            GameStatus::Won => match !input_b.board().side_to_move() {
+                Color::White => Wdl {
+                    w: 1.0,
+                    d: 0.0,
+                    l: 0.0,
+                },
+                Color::Black => Wdl {
+                    w: 0.0,
+                    d: 0.0,
+                    l: 1.0,
+                },
+            },
+            GameStatus::Ongoing => {
+                unreachable!()
+            }
+        };
+        debug_print!("terminal! {:#} {:?}", input_b.board(), wdl);
+        self.nodes[selected_node].net_evaluation.value = wdl.w - wdl.l;
+        self.nodes[selected_node].net_evaluation.wdl = wdl;
+        self.nodes[selected_node].net_evaluation.moves_left = 0.0;
+    }
+
+    /// adds one pending (virtual) visit to `node` and every ancestor up to the root: the same
+    /// path that `backpropagate` will later walk
+    pub fn add_virtual_visit(&mut self, node: usize) {
+        let mut curr = Some(node);
+        while let Some(current) = curr {
+            self.nodes[current].virtual_visits += 1;
+            curr = self.nodes[current].parent;
+        }
+    }
+
+    /// undoes `add_virtual_visit(node)`
+    pub fn remove_virtual_visit(&mut self, node: usize) {
+        let mut curr = Some(node);
+        while let Some(current) = curr {
+            assert!(
+                self.nodes[current].virtual_visits > 0,
+                "virtual visit removed twice at node {current}"
+            );
+            self.nodes[current].virtual_visits -= 1;
+            curr = self.nodes[current].parent;
         }
     }
 
@@ -438,6 +534,16 @@ impl Tree {
                 total_visits += self.nodes[child].visits;
             }
             (_, max_depth) = self.depth_range(curr);
+            // pending visits of this round count towards N, so U and Q see the leaves already
+            // chosen. A node with children has as many virtual visits as its children together.
+            let parent_visits = curr_node.visits + curr_node.virtual_visits;
+            debug_assert_eq!(
+                curr_node.virtual_visits,
+                children
+                    .clone()
+                    .map(|c| self.nodes[c].virtual_visits)
+                    .sum::<u32>()
+            );
             curr = children
                 .clone()
                 .max_by(|a, b| {
@@ -446,13 +552,13 @@ impl Tree {
                     let a_node = &self.nodes[*a];
                     let b_node = &self.nodes[*b];
                     let a_puct = a_node.puct_formula(
-                        curr_node.visits,
+                        parent_visits,
                         parent_moves_left,
                         input_b.board().side_to_move(),
                         self.settings,
                     );
                     let b_puct = b_node.puct_formula(
-                        curr_node.visits,
+                        parent_visits,
                         parent_moves_left,
                         input_b.board().side_to_move(),
                         self.settings,
@@ -469,6 +575,7 @@ impl Tree {
                 })
                 .expect("Error");
 
+            // real visits only: virtual visits are kept apart and never reach `visits`
             assert!(total_visits + 1 == curr_node.visits);
             if !visited_nodes.contains(&curr) {
                 visited_nodes.push(curr);
@@ -494,48 +601,52 @@ impl Tree {
         (curr, input_b, (depth, max_depth))
     }
 
-    /// evaluates selected node using the neural network by sending the input tensors to `executor.rs` through async sender
-    /// then the results are sent back and calls `decoder.rs` to process the nn ouputs and update the tree
-    async fn eval_and_expand(
-        &mut self,
-        selected_node_idx: &usize,
+    /// sends the input tensor of `bs` to `executor.rs` and returns the channel its result comes
+    /// back on; `receive_and_expand` finishes the evaluation
+    async fn send_for_eval(
+        &self,
         bs: &BoardStack,
         tensor_exe_send: &Sender<Packet>,
-        _id: usize,
-        cache: &mut LruCache<CacheEntryKey, ZeroEvaluationAbs>,
-    ) -> Vec<usize> {
+    ) -> Receiver<ReturnMessage> {
         debug_print!("    eval_and_expand:");
 
         let input = board_input(bs);
 
         let (resender_send, resender_recv) = flume::bounded::<ReturnMessage>(1);
-        let thread_name = std::thread::current()
-            .name()
-            .unwrap_or("unnamed-generator")
-            .to_owned();
         let pack = Packet {
             job: input,
             resender: resender_send,
-            id: thread_name.clone(),
+            id: generator_thread_name(),
         };
 
         tensor_exe_send.send_async(pack).await.unwrap();
+        resender_recv
+    }
 
+    /// waits for the network output of `bs` and calls `decoder.rs` to process it and expand
+    /// `selected_node_idx`
+    async fn receive_and_expand(
+        &mut self,
+        selected_node_idx: usize,
+        bs: &BoardStack,
+        resender_recv: Receiver<ReturnMessage>,
+        cache: &mut LruCache<CacheEntryKey, ZeroEvaluationAbs>,
+    ) -> Vec<usize> {
         let output = resender_recv.recv_async().await.unwrap();
         let output = match output {
             ReturnMessage::ReturnMessage(Ok(output)) => output,
             ReturnMessage::ReturnMessage(Err(_)) => panic!("error in returning!"),
         };
 
-        assert!(thread_name == output.id);
+        assert!(generator_thread_name() == output.id);
         let idx_li = process_board_output(
             (&output.packet.0[..], &output.packet.1[..]),
-            selected_node_idx,
+            &selected_node_idx,
             self,
             bs,
             cache,
         );
-        debug_print!("        expanded {}", self.display_node(*selected_node_idx));
+        debug_print!("        expanded {}", self.display_node(selected_node_idx));
         idx_li
     }
 
@@ -598,10 +709,12 @@ impl Tree {
                     u = f32::NAN;
                     puct = f32::NAN;
                 } else {
-                    u = self.nodes[id].get_u_val(self.nodes[*parent].visits, self.settings);
+                    let parent_visits =
+                        self.nodes[*parent].visits + self.nodes[*parent].virtual_visits;
+                    u = self.nodes[id].get_u_val(parent_visits, self.settings);
 
                     puct = self.nodes[id].puct_formula(
-                        self.nodes[*parent].visits,
+                        parent_visits,
                         self.nodes[*parent].total_evaluation.moves_left
                             / self.nodes[*parent].visits as f32,
                         !bs_clone.board().side_to_move(),
@@ -687,6 +800,9 @@ pub struct Node {
     pub children: Range<usize>,
     pub policy: f32,
     pub visits: u32,
+    /// descents through this node still waiting for their leaf's evaluation in the current
+    /// `Tree::step`. Zero between steps.
+    pub virtual_visits: u32,
     pub net_evaluation: ZeroValuesAbs,
     pub total_evaluation: ZeroValuesAbs,
     pub mv: Option<Move>,
@@ -700,6 +816,7 @@ impl Node {
             children: 0..0,
             policy,
             visits: 0,
+            virtual_visits: 0,
             net_evaluation: ZeroValuesAbs::nan(),
             total_evaluation: ZeroValuesAbs::zeros(),
             mv,
@@ -714,14 +831,18 @@ impl Node {
         matches!(self.parent, None | Some(0))
     }
 
+    /// mean value of this node for the player choosing it (`relative_evaluation` must be from
+    /// that player's point of view). Each virtual visit counts as a loss (-1) for that player,
+    /// so a pending leaf looks worse to the side that would pick it again.
     pub fn get_q_val(&self, settings: SearchSettings, relative_evaluation: ZeroValuesPov) -> f32 {
         let fpu = settings.fpu;
-        if self.visits > 0 {
+        let n = self.visits + self.virtual_visits;
+        if n > 0 {
             let total = match settings.wdl {
                 EvalMode::Wdl => relative_evaluation.wdl.w - relative_evaluation.wdl.l,
                 EvalMode::Value => relative_evaluation.value,
             };
-            total / (self.visits as f32)
+            (total - self.virtual_visits as f32) / (n as f32)
         } else {
             if self.is_root_or_root_child() {
                 fpu.root_fpu
@@ -738,9 +859,12 @@ impl Node {
             settings.c_puct.children_c_puct
         };
 
-        c_puct * self.policy * ((parent_visits - 1) as f32).sqrt() / (1.0 + self.visits as f32)
+        c_puct * self.policy * ((parent_visits - 1) as f32).sqrt()
+            / (1.0 + (self.visits + self.virtual_visits) as f32)
     }
 
+    /// `parent_visits` counts the parent's real and virtual visits; `player` is the side to
+    /// move at the parent, i.e. the side choosing this node
     pub fn puct_formula(
         &self,
         parent_visits: u32,
@@ -748,7 +872,7 @@ impl Node {
         player: Color,
         settings: SearchSettings,
     ) -> f32 {
-        assert!(self.visits < parent_visits);
+        assert!(self.visits + self.virtual_visits < parent_visits);
 
         let relative_evaluation = self.total_evaluation.to_relative(player);
         let u = self.get_u_val(parent_visits, settings);
