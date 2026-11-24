@@ -159,6 +159,12 @@ class Telemetry:
                 git_sha=identity.git_sha,
                 git_dirty=identity.git_dirty,
             )
+        # wandb infers the program's path from the git root and the cwd with os.path.relpath,
+        # which raises on Windows when they are on different mounts (a mapped drive U: whose
+        # git root resolves to \\server\share). The commit is already in config (git_sha),
+        # so skip wandb's own git and code capture unless the user asked for it.
+        os.environ.setdefault("WANDB_DISABLE_GIT", "true")
+        os.environ.setdefault("WANDB_DISABLE_CODE", "true")
         wrun = wandb.init(
             project=observe["wandb"]["project"],
             entity=observe["wandb"]["entity"] or None,
