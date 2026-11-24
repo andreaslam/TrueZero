@@ -14,6 +14,7 @@ use std::{
     thread as std_thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
+use tch::{Device, Kind, Tensor};
 
 use tzrust::{
     data_path, data_path_str,
@@ -217,7 +218,7 @@ fn run_test(
                 //
                 // [1, 1344] CPU tensor.
                 //
-                let input = vec![0.0_f32; 1344];
+                let input = Tensor::zeros([1, 1344], (Kind::Float, Device::Cpu));
 
                 //
                 // Maintain exactly `in_flight` requests.
@@ -255,7 +256,7 @@ fn run_test(
 
                     sender
                         .send(Packet {
-                            job: input.clone(),
+                            job: input.shallow_clone(),
                             resender: tx,
                             id: id.to_string(),
                         })
@@ -290,7 +291,7 @@ fn run_test(
 
                     sender
                         .send(Packet {
-                            job: input.clone(),
+                            job: input.shallow_clone(),
                             resender: tx,
                             id: id.to_string(),
                         })

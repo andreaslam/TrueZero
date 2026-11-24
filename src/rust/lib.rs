@@ -1,20 +1,18 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 pub fn workspace_root() -> PathBuf {
-    runconfig::repo_root()
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("..").join("..")
 }
 
-/// `rel` inside this process's data root: the current run's folder (see
-/// `runconfig::data_root`).
+/// Data folders (nets/, games/, hidden/, ...) live under the workspace root.
 pub fn data_path(rel: &str) -> PathBuf {
-    runconfig::data_root().join(rel)
+    workspace_root().join(rel)
 }
 pub fn data_path_str(rel: &str) -> String {
     data_path(rel).to_string_lossy().into_owned()
 }
 
 pub mod boardmanager;
-pub mod books;
 pub mod cache;
 pub mod dataformat;
 pub mod decoder;
@@ -26,7 +24,6 @@ pub mod mcts;
 pub mod mcts_trainer;
 pub mod message_types;
 pub mod mvs;
-pub mod runconfig;
 pub mod selfplay;
 pub mod settings;
 pub mod uci;
@@ -323,6 +320,7 @@ mod tests {
     use executor::{Packet, ReturnMessage, ReturnPacket};
     use lru::LruCache;
     use std::num::NonZeroUsize;
+    use tch::{Device, Kind, Tensor};
 
     const STUB_SEARCH_NODES: u32 = 200;
 
@@ -342,8 +340,8 @@ mod tests {
         let policy_len = mvs::get_contents().len() as i64;
         std::thread::spawn(move || {
             for packet in recv.iter() {
-                let board_eval = vec![0.0_f32; 5];
-                let policy = vec![0.0_f32; policy_len as usize];
+                let board_eval = Tensor::zeros([5], (Kind::Float, Device::Cpu));
+                let policy = Tensor::zeros([policy_len], (Kind::Float, Device::Cpu));
                 let _ = packet
                     .resender
                     .send(ReturnMessage::ReturnMessage(Ok(ReturnPacket {
@@ -463,7 +461,7 @@ mod tests {
         // the network must never be consulted for a terminal node: no executor behind this
         let (sender, _recv) = flume::unbounded::<Packet>();
         let mut cache = new_cache();
-        // one descent per step, so one step is one visit whatever TZ_VIRTUAL_LEAVES says
+        // one descent per step, so one step is one visit whatever VIRTUAL_LEAVES says
         tree.virtual_leaves = 1;
         futures::executor::block_on(tree.step(&sender, std::time::Instant::now(), 1, &mut cache));
 
@@ -494,8 +492,8 @@ mod tests {
     //
     // Opt-in, because it needs a TorchScript net on disk. From src/python:
     //   python -c "import torch, network; torch.jit.save(torch.jit.script(network.TrueNetXS(num_resBlocks=1, num_hidden=8)).eval(), '/tmp/tz_e2e.pt')"
-    //   TZ_E2E_NET=/tmp/tz_e2e.pt TZ_E2E_OUT=/tmp/tz_e2e_games cargo test --lib -- --ignored selfplay_with_a_real_network
-    // then load `TZ_E2E_OUT` with `lib.data.file.DataFile.open` and train on it.
+    //   cargo test --lib -- --ignored selfplay_with_a_real_network
+    // then load `E2E_OUT` with `lib.data.file.DataFile.open` and train on it.
     #[test]
     #[ignore]
     fn selfplay_with_a_real_network_writes_a_kzero_file() {
@@ -504,8 +502,10 @@ mod tests {
         use crate::mcts_trainer::TypeRequest::TrainerSearch;
         use crate::selfplay::{CollectorMessage, DataGen};
 
-        let net = std::env::var("TZ_E2E_NET").expect("TZ_E2E_NET");
-        let out = std::env::var("TZ_E2E_OUT").expect("TZ_E2E_OUT");
+        const E2E_NET: &str = "/tmp/tz_e2e.pt";
+        const E2E_OUT: &str = "/tmp/tz_e2e_games";
+        let net = E2E_NET.to_string();
+        let out = E2E_OUT.to_string();
 
         let (tensor_send, tensor_recv) = flume::bounded::<Packet>(1);
         let (ctrl_send, ctrl_recv) = flume::bounded::<Message>(1);
@@ -517,10 +517,7 @@ mod tests {
         settings.max_nodes = Some(8);
         let mut cache = LruCache::new(NonZeroUsize::new(1000).unwrap());
         let mut output = BinaryOutput::new(&out, "chess").unwrap();
-        let datagen = DataGen {
-            iterations: 1,
-            playout_cap: None,
-        };
+        let datagen = DataGen { iterations: 1 };
         for game in 0..2 {
             let simulation = futures::executor::block_on(datagen.play_game(
                 &tensor_send,

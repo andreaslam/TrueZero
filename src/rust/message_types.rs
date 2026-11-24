@@ -31,12 +31,6 @@ pub enum MessageType {
     TBLinkRequest(),
     TestResult(GateTesterResult),
     EvaluationRequest(ExternalPacket), // use Vec<f32> to handle raw input data
-    /// Server -> every client after it identifies: the id of the current run. A client
-    /// that started under another run exits so the launcher restarts it on this one.
-    RunInfo(String),
-    /// `server reset` -> the running server: a new run was created (its id). The server
-    /// forgets its nets and forwards this to every client, which then restart.
-    ResetRun(String),
 }
 
 #[pyclass]

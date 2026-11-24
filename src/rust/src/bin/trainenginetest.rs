@@ -39,7 +39,6 @@ use tzrust::{
     mcts::get_move,
     mcts_trainer::{EvalMode, TypeRequest::NonTrainerSearch},
     message_types::{Entity, GateTesterResult, MessageServer, MessageType},
-    runconfig::{exit_for_restart, repo_root, start_client},
     settings::{CPUCTSettings, FPUSettings, MovesLeftSettings, PSTSettings, SearchSettings},
     utils::directory_exists,
 };
@@ -116,19 +115,6 @@ fn should_early_reject(wins: u32, losses: u32) -> bool {
 }
 
 fn main() {
-    let (loaded, run_identity) = start_client("gate");
-    let run_id = run_identity.run_id.clone();
-    let openings_path = loaded
-        .config
-        .repo_path(&repo_root(), &loaded.config.gate.openings)
-        .to_string_lossy()
-        .into_owned();
-    if !Path::new(&openings_path).is_file() {
-        if let Err(e) = tzrust::books::ensure_book(Path::new(&openings_path), &repo_root()) {
-            eprintln!("[gate] Could not get the opening book {openings_path}: {e}");
-            std::process::exit(1);
-        }
-    }
     let pool = ThreadPool::builder().pool_size(6).create().unwrap();
 
     env::set_var("RUST_BACKTRACE", "2");
@@ -138,11 +124,10 @@ fn main() {
         std::process::exit(1);
     }));
 
-    let server_addr = loaded.config.server_addr();
     let mut stream = loop {
-        match TcpStream::connect(&server_addr) {
+        match TcpStream::connect("127.0.0.1:38475") {
             Ok(s) => break s,
-            Err(_) => std::thread::sleep(std::time::Duration::from_millis(200)),
+            Err(_) => continue,
         }
     };
 
@@ -244,8 +229,6 @@ fn main() {
                     commander_ready1,
                     commander_job_send,
                     num_game_pairs,
-                    &run_id,
-                    &openings_path,
                 )
             })
             .unwrap();
@@ -740,8 +723,6 @@ fn commander_main(
     ready1: Receiver<bool>,
     job_send: Sender<GamePair>,
     num_game_pairs: usize,
-    run_id: &str,
-    openings_path: &str,
 ) {
     let mut is_initialised = false;
 
@@ -787,9 +768,8 @@ fn commander_main(
 
         let mut recv_msg = String::new();
 
-        match reader.read_line(&mut recv_msg) {
-            Ok(0) | Err(_) => exit_for_restart("the server connection closed"),
-            Ok(_) => {}
+        if reader.read_line(&mut recv_msg).is_err() {
+            return;
         }
 
         let message = match serde_json::from_str::<MessageServer>(&recv_msg) {
@@ -800,14 +780,6 @@ fn commander_main(
                 continue;
             }
         };
-
-        match &message.purpose {
-            MessageType::RunInfo(id) if id != run_id => {
-                exit_for_restart(&format!("the server is on run {id}, not {run_id}"))
-            }
-            MessageType::ResetRun(id) => exit_for_restart(&format!("new run {id}")),
-            _ => {}
-        }
 
         if is_initialised {
             match message.purpose {
@@ -1014,8 +986,8 @@ fn commander_main(
                 total_pairs_dispatched * 2
             );
 
-            let openings = read_epd_file(openings_path)
-                .unwrap_or_else(|e| panic!("cannot read opening book {openings_path}: {e}"));
+            let openings =
+                read_epd_file(&data_path_str("hidden/8moves_v3.epd")).expect("EPD file missing");
 
             let mut rng = rand::thread_rng();
 

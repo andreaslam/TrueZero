@@ -14,7 +14,7 @@ if [ "$#" -eq 0 ]; then
 fi
 
 case "$1" in
-  main|server|ucimain|lichess|ladder|battle|enginetest|experiment|getdecode|getgame|getinference|getinferencetime|getmove|mps|trainenginetest)
+  main|server|ucimain|lichess|battle|enginetest|experiment|getdecode|getgame|getinference|getinferencetime|getmove|mps|trainenginetest)
     set -- "/opt/truezero/bin/$@"
     ;;
   python)

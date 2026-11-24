@@ -13,6 +13,7 @@ pub struct SearchSettings {
     pub search_type: TypeRequest,
     pub pst: PSTSettings,
     pub batch_size: usize,
+    // pub cap_randomisation: Option<PlayoutCapSettings>,
 }
 
 #[derive(Clone, Debug, PartialEq, Copy)]
@@ -58,52 +59,21 @@ impl CPUCTSettings {
         }
     }
 }
-/// Playout cap randomisation (KataGo, Wu 2019, section 3.1).
-///
-/// Each self-play move is a full search with probability `full_search_prob`, using the
-/// normal `SearchSettings::max_nodes`. Every other move is a fast search capped at
-/// `fast_visits`, with no Dirichlet noise, and is recorded with `is_full_search = false`.
-/// Fast searches finish games sooner (more value targets per unit of compute) while the
-/// full searches still give strong policy targets.
 #[derive(Clone, Debug, PartialEq, Copy)]
 pub struct PlayoutCapSettings {
-    pub full_search_prob: f32,
-    pub fast_visits: u32,
-    /// Stop a fast search once its most-visited root move cannot be overtaken by the visits
-    /// left. Only applied when the move is played greedily, so it never changes the move.
-    pub fast_early_stop: bool,
+    pub start_min: usize,
+    pub finish_min: usize,
+    pub start_max: usize,
+    pub finish_max: usize,
 }
 
 impl PlayoutCapSettings {
-    pub fn new(full_search_prob: f32, fast_visits: u32, fast_early_stop: bool) -> Self {
-        assert!(
-            (0.0..=1.0).contains(&full_search_prob),
-            "full_search_prob must be in [0, 1], got {full_search_prob}"
-        );
-        assert!(
-            fast_visits >= 2,
-            "fast_visits must be at least 2, got {fast_visits}"
-        );
+    pub fn new(start_min: usize, finish_min: usize, start_max: usize, finish_max: usize) -> Self {
         Self {
-            full_search_prob,
-            fast_visits,
-            fast_early_stop,
-        }
-    }
-
-    /// The search settings for one move: unchanged for a full search; for a fast search the
-    /// visit cap is `fast_visits` (never above the full cap) and root noise is off.
-    pub fn move_settings(&self, settings: &SearchSettings, full: bool) -> SearchSettings {
-        if full {
-            return *settings;
-        }
-        let full_cap = settings
-            .max_nodes
-            .expect("playout cap randomisation needs a node limit");
-        SearchSettings {
-            max_nodes: Some(full_cap.min(self.fast_visits as u128)),
-            eps: 0.0,
-            ..*settings
+            start_min,
+            finish_min,
+            start_max,
+            finish_max,
         }
     }
 }

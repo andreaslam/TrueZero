@@ -33,9 +33,6 @@ RUN --mount=type=cache,target=/root/.cache/uv \
 ENV PATH="/opt/venv/bin:${PATH}" \
     LIBTORCH="$(python3 -c 'import torch; print(torch.__path__[0])')"
 
-# The commit being built (.git is not in the build context); recorded in each run (runs/<id>/run.json).
-ARG TZ_BUILD_GIT_SHA=unknown
-ENV TZ_BUILD_GIT_SHA=${TZ_BUILD_GIT_SHA}
 COPY src/rust/Cargo.toml src/rust/Cargo.lock src/rust/
 COPY src/rust /opt/truezero/src/rust
 RUN --mount=type=cache,target=/root/.cargo/registry \
@@ -47,9 +44,7 @@ FROM nvidia/cuda:${CUDA_VERSION}-cudnn8-runtime-ubuntu22.04 AS runtime
 
 ARG APP_UID=10001
 ARG APP_GID=10001
-ARG TZ_BUILD_GIT_SHA=unknown
 ENV DEBIAN_FRONTEND=noninteractive \
-    TZ_BUILD_GIT_SHA=${TZ_BUILD_GIT_SHA} \
     TZ_DATA_ROOT=/data \
     TZ_DEVICE=auto \
     TZ_MODEL_PATH=/data/nets/tz_0.pt \
@@ -69,8 +64,6 @@ COPY --from=builder /opt/truezero/src/rust/target/release/ /opt/truezero/bin/
 COPY --from=builder /opt/venv /opt/venv
 COPY --from=builder /opt/truezero/src/python /opt/truezero/src/python
 COPY docker/entrypoint.sh /usr/local/bin/truezero
-# Every program reads its settings from here (truezero.toml is created from it).
-COPY truezero.example.toml /opt/truezero/truezero.example.toml
 
 RUN chmod 0755 /usr/local/bin/truezero && \
     chown -R truezero:truezero /opt/truezero /opt/libtorch

@@ -53,6 +53,3 @@ dotenv_codegen = "0.15.0"
 futures-util = "0.3.34"
 crossterm = "0.29.0"
 num_cpus = "1.17.0"
-toml = "0.8"
-ureq = { version = "2.6", features = ["proxy-from-env"] }
-zip = { version = "0.6", default-features = false, features = ["deflate"] }

@@ -1,5 +1,4 @@
 use std::{
-    collections::HashMap,
     io::{BufRead, BufReader, Write},
     net::{TcpListener, TcpStream},
     sync::{Arc, Mutex},
@@ -11,7 +10,6 @@ use sha2::{Digest, Sha256};
 use tzrust::{
     debug_print,
     message_types::{Entity, GateTesterResult, MessageServer, MessageType},
-    runconfig::{create_run, current_run_id, load_config, repo_root},
 };
 
 fn net_checksum(data: &[u8]) -> String {
@@ -71,19 +69,11 @@ fn clear_pending_candidate(
     had_pending
 }
 
-/// Latest (nodes/s, evals/s, time reported) from each client, keyed by peer address. Clients send
-/// rates, so the server shows the sum of each client's latest rate rather than adding up every
-/// message that happens to land in its print window.
-type ClientRates = HashMap<String, (usize, usize, Instant)>;
-
-/// A client whose last report is older than this no longer counts towards the totals.
-const STATS_STALE_AFTER: Duration = Duration::from_secs(10);
-
 fn handle_client(
     stream: TcpStream,
     clients: Arc<Mutex<Vec<TcpStream>>>,
     messages: Arc<Mutex<Vec<MessageServer>>>,
-    stats_counters: Arc<Mutex<ClientRates>>,
+    stats_counters: Arc<Mutex<(usize, usize)>>,
     start_time: Arc<Mutex<Instant>>,
     net_path: Arc<Mutex<Option<String>>>,
     net_data: Arc<Mutex<Option<Vec<u8>>>>,
@@ -98,7 +88,6 @@ fn handle_client(
     training_streams: Arc<Mutex<Vec<TcpStream>>>,
     datagen_streams: Arc<Mutex<Vec<TcpStream>>>,
     h0_sent_to_datagen: Arc<Mutex<bool>>,
-    run_id: Arc<Mutex<String>>,
 ) {
     let mut cloned_handle = stream.try_clone().unwrap();
     let mut reader = BufReader::new(&stream);
@@ -373,16 +362,6 @@ fn handle_client(
                         );
                     }
 
-                    // Tell the client which run this is, so one that started under an
-                    // earlier run restarts on this one.
-                    let run_info = to_wire(&MessageServer {
-                        purpose: MessageType::RunInfo(run_id.lock().unwrap().clone()),
-                    });
-                    if let Err(msg) = cloned_handle.write_all(run_info.as_bytes()) {
-                        eprintln!("Error sending run info! {}", msg);
-                        break;
-                    }
-
                     if matches!(client_entity, Some(Entity::GateTesterRunner)) {
                         let latest = latest_net.lock().unwrap().clone();
                         let pending = pending_candidate.lock().unwrap().clone();
@@ -452,32 +431,27 @@ fn handle_client(
                 MessageType::StatisticsSend(statistics) => {
                     debug_print!("StatisticsSend message received: {:?}", statistics);
 
-                    let mut rates = stats_counters.lock().unwrap_or_else(|e| e.into_inner());
+                    let mut stats = stats_counters.lock().unwrap_or_else(|e| e.into_inner());
 
                     let mut start_time = start_time.lock().unwrap_or_else(|e| e.into_inner());
 
-                    let entry = rates
-                        .entry(peer_addr.clone())
-                        .or_insert((0, 0, Instant::now()));
+                    let elapsed = start_time.elapsed().as_secs_f32() as usize;
+
                     match statistics {
                         tzrust::message_types::Statistics::NodesPerSecond(nps) => {
-                            entry.0 = nps;
+                            stats.0 += nps;
                         }
 
                         tzrust::message_types::Statistics::EvalsPerSecond(evals_per_sec) => {
-                            entry.1 = evals_per_sec;
+                            stats.1 += evals_per_sec;
                         }
                     }
-                    entry.2 = Instant::now();
 
-                    if start_time.elapsed() >= Duration::from_secs(1) {
-                        rates.retain(|_, r| r.2.elapsed() < STATS_STALE_AFTER);
-                        let (nps, evals) = rates
-                            .values()
-                            .fold((0, 0), |acc, r| (acc.0 + r.0, acc.1 + r.1));
-                        println!("[Statistics-nps] {}", nps);
-                        println!("[Statistics-evals] {}", evals);
+                    if elapsed >= 1 {
+                        println!("[Statistics-nps] {}", stats.0);
+                        println!("[Statistics-evals] {}", stats.1);
 
+                        *stats = (0, 0);
                         *start_time = Instant::now();
                     }
 
@@ -776,38 +750,6 @@ fn handle_client(
                 MessageType::EvaluationRequest(_input_data) => {
                     debug_print!("EvaluationRequest message received: {:?}", _input_data);
                 }
-
-                MessageType::RunInfo(_) => {}
-
-                MessageType::ResetRun(new_run_id) => {
-                    // `server reset` created a new run: forget everything about the old
-                    // one and tell every client to restart on the new one.
-                    println!("[Server] Reset: new run {new_run_id}; clients will restart");
-                    *run_id.lock().unwrap() = new_run_id.clone();
-                    *net_path = None;
-                    *net_data = None;
-                    *transfer_in_progress = false;
-                    all_messages.clear();
-                    *latest_net.lock().unwrap() = None;
-                    *latest_net_checksum.lock().unwrap() = None;
-                    clear_pending_candidate(
-                        &pending_candidate,
-                        &pending_candidate_checksum,
-                        &pending_tester_peer,
-                    );
-                    *h0_sent_to_datagen.lock().unwrap() = false;
-                    let wire = to_wire(&MessageServer {
-                        purpose: MessageType::ResetRun(new_run_id),
-                    });
-                    let mut all_clients = clients.lock().unwrap();
-                    let n = write_to_live_streams(&mut all_clients, &wire);
-                    println!("[Server] Sent reset to {} connection(s)", n);
-                    datagen_streams.lock().unwrap().clear();
-                    training_streams.lock().unwrap().clear();
-                    gate_tester_streams.lock().unwrap().clear();
-                    recv_msg.clear();
-                    continue;
-                }
             }
 
             let all_clients = clients.lock().unwrap();
@@ -869,76 +811,8 @@ fn handle_client(
     }
 }
 
-/// `server` serves the current run (creating the first one if there is none).
-/// `server reset` creates a new run; if a server is already running it is told to switch
-/// (and to tell every client to restart), otherwise this process becomes the server.
 fn main() {
-    let reset = std::env::args().skip(1).any(|a| a == "reset");
-    let loaded = load_config();
-    let root = repo_root();
-    let runs_dir = loaded.config.runs_dir(&root);
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-    let pinned = std::env::var_os("TZ_DATA_ROOT").map(std::path::PathBuf::from);
-    let current = match (&pinned, current_run_id(&runs_dir)) {
-        // TZ_DATA_ROOT (Docker) pins one data folder: its name is the run, no runs/.
-        (Some(root), _) => {
-            if reset {
-                eprintln!(
-                    "[Server] TZ_DATA_ROOT pins the data folder to {}; `reset` needs it unset \
-                     (or point it at a new folder).",
-                    root.display()
-                );
-                std::process::exit(2);
-            }
-            root.file_name()
-                .map(|n| n.to_string_lossy().into_owned())
-                .unwrap_or_default()
-        }
-        (None, Some(id)) if !reset => id,
-        _ => {
-            let id = create_run(&runs_dir, &loaded, now).unwrap_or_else(|e| {
-                eprintln!("[Server] Could not create a run in {}: {e}", runs_dir.display());
-                std::process::exit(2)
-            });
-            println!(
-                "[Server] Created run {id} in {}",
-                runs_dir.join(&id).display()
-            );
-            id
-        }
-    };
-
-    let port = loaded.config.server.port;
-    if reset {
-        if let Ok(mut running) = TcpStream::connect(("127.0.0.1", port)) {
-            let wire = to_wire(&MessageServer {
-                purpose: MessageType::ResetRun(current.clone()),
-            });
-            match running.write_all(wire.as_bytes()) {
-                Ok(()) => {
-                    println!(
-                        "[Server] Told the running server to switch to run {current}; its \
-                         clients restart on it (under the launcher, automatically)."
-                    );
-                    return;
-                }
-                Err(e) => eprintln!("[Server] Could not reach the running server: {e}"),
-            }
-        }
-    }
-
-    let listener = TcpListener::bind(("0.0.0.0", port)).unwrap_or_else(|e| {
-        eprintln!(
-            "[Server] Cannot listen on port {port}: {e}. Is another server running? \
-             (`server reset` resets a running one.)"
-        );
-        std::process::exit(1)
-    });
-    println!("[Server] Run {current}, listening on port {port}");
-    let run_id: Arc<Mutex<String>> = Arc::new(Mutex::new(current));
+    let listener = TcpListener::bind("0.0.0.0:38475").expect("Failed to bind address");
 
     let clients: Arc<Mutex<Vec<TcpStream>>> = Arc::new(Mutex::new(Vec::new()));
 
@@ -950,7 +824,7 @@ fn main() {
 
     let tb_link: Arc<Mutex<Option<(String, String)>>> = Arc::new(Mutex::new(None));
 
-    let stats_counters: Arc<Mutex<ClientRates>> = Arc::new(Mutex::new(HashMap::new()));
+    let stats_counters: Arc<Mutex<(usize, usize)>> = Arc::new(Mutex::new((0, 0)));
 
     let start_time: Arc<Mutex<Instant>> = Arc::new(Mutex::new(Instant::now()));
 
@@ -999,7 +873,6 @@ fn main() {
                 let cloned_training_streams = Arc::clone(&training_streams);
                 let cloned_datagen_streams = Arc::clone(&datagen_streams);
                 let cloned_h0_sent = Arc::clone(&h0_sent_to_datagen);
-                let cloned_run_id = Arc::clone(&run_id);
 
                 println!("[Server] New connection: {}", addr);
 
@@ -1031,7 +904,6 @@ fn main() {
                         cloned_training_streams,
                         cloned_datagen_streams,
                         cloned_h0_sent,
-                        cloned_run_id,
                     );
                 });
             }
