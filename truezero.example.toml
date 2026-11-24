@@ -120,7 +120,9 @@ tactics = ""
 tactics_nodes = 400
 
 [launcher]
-# How the launcher starts the trainer (client.py, run from src/python).
+# How the launcher starts the trainer (client.py, run from src/python). uv is found even
+# when it is not on PATH (~/.local/bin, ~/.cargo/bin); without uv, the venv's own Python
+# (venv below, else UV_PROJECT_ENVIRONMENT, else .venv) runs it directly.
 python = ["uv", "run", "python"]
 # Folder for the Python environment, passed to uv as UV_PROJECT_ENVIRONMENT. Keep it on a
 # local disk if the repository is on a network drive (numpy's DLLs fail to load from a

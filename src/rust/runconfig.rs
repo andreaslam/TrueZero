@@ -359,7 +359,7 @@ impl Config {
 
     /// A path from the config that is relative to the repository root.
     pub fn repo_path(&self, root: &Path, rel: &str) -> PathBuf {
-        root.join(rel)
+        crate::books::normalise(&root.join(rel))
     }
 }
 
