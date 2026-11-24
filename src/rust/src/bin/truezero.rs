@@ -260,21 +260,31 @@ fn main() {
         console: Arc::new(Mutex::new(())),
     };
 
-    // The gate's opening book (a fresh clone has none).
-    let book = launcher.root.join(&launcher.cfg.gate.openings);
-    if !book.is_file() {
-        let dest = book.to_string_lossy().into_owned();
-        let status = launcher
-            .python_command(&["books.py", &dest])
-            .status()
-            .map(|s| s.success())
-            .unwrap_or(false);
-        if !status || !book.is_file() {
-            eprintln!(
-                "[truezero] Could not get the opening book {dest}. Download 8moves_v3.epd.zip \
-                 from https://github.com/official-stockfish/books, unzip it there and run again."
-            );
-            std::process::exit(1);
+    // The gate's (and the ladder's) opening book: a fresh clone has none.
+    let mut books = vec![launcher.cfg.gate.openings.clone()];
+    let ladder_on = launcher.cfg.ladder.get("enabled") == Some(&toml::Value::Boolean(true));
+    if let Some(toml::Value::String(o)) = launcher.cfg.ladder.get("openings") {
+        if ladder_on && !books.contains(o) {
+            books.push(o.clone());
+        }
+    }
+    for rel in books {
+        let book = launcher.cfg.repo_path(&launcher.root, &rel);
+        if book.is_file() {
+            continue;
+        }
+        println!("[truezero] Fetching the opening book {}...", book.display());
+        match tzrust::books::ensure_book(&book, &launcher.root) {
+            Ok(how) => println!("[truezero] {}: {how}", book.display()),
+            Err(e) => {
+                eprintln!(
+                    "[truezero] Could not get the opening book {}: {e}\n\
+                     [truezero] Check the internet connection (behind a proxy, set HTTPS_PROXY) \
+                     and run again.",
+                    book.display()
+                );
+                std::process::exit(1);
+            }
         }
     }
 

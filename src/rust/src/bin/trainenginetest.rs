@@ -124,11 +124,10 @@ fn main() {
         .to_string_lossy()
         .into_owned();
     if !Path::new(&openings_path).is_file() {
-        eprintln!(
-            "[gate] Opening book {openings_path} is missing. The launcher downloads it; or run \
-             `uv run python src/python/books.py`."
-        );
-        std::process::exit(1);
+        if let Err(e) = tzrust::books::ensure_book(Path::new(&openings_path), &repo_root()) {
+            eprintln!("[gate] Could not get the opening book {openings_path}: {e}");
+            std::process::exit(1);
+        }
     }
     let pool = ThreadPool::builder().pool_size(6).create().unwrap();
 
