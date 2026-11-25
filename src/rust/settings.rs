@@ -12,6 +12,7 @@ pub struct SearchSettings {
     pub eps: f32,
     pub search_type: TypeRequest,
     pub pst: PSTSettings,
+    /// leaves gathered per `Tree::step` with virtual loss; 1 is plain sequential MCTS
     pub batch_size: usize,
     // pub cap_randomisation: Option<PlayoutCapSettings>,
 }

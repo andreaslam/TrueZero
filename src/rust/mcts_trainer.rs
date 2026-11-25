@@ -131,11 +131,12 @@ pub struct Tree {
     pub pv: String,
     pub root_net_policy: Option<Vec<f32>>,
     /// leaves gathered per `step` (virtual-loss leaf batching); 1 is plain sequential MCTS.
-    /// Set from `VIRTUAL_LEAVES` by `Tree::new`.
+    /// Set from `SearchSettings::batch_size` by `Tree::new`.
     pub virtual_leaves: usize,
 }
 
-/// Leaves each search gathers per `Tree::step` before waiting for their evaluations
+/// Default `SearchSettings::batch_size`, used by every search except UCI, which sets it from
+/// the `Threads` option. Leaves each search gathers per `Tree::step` before waiting for their evaluations
 /// (virtual-loss leaf batching). 1 is plain sequential MCTS, the default; set it to e.g. 8
 /// to opt in. Must be at least 1.
 pub const VIRTUAL_LEAVES: usize = 1;
@@ -161,7 +162,7 @@ impl Tree {
             settings,
             pv,
             root_net_policy: None,
-            virtual_leaves: VIRTUAL_LEAVES,
+            virtual_leaves: settings.batch_size.max(1),
         }
     }
 
@@ -194,7 +195,7 @@ impl Tree {
             None => self.virtual_leaves,
         };
 
-        let mut pending: Vec<(usize, BoardStack, Receiver<ReturnMessage>)> = Vec::new();
+        let mut pending: Vec<(usize, BoardStack)> = Vec::new();
         let mut depths = (0, 0);
 
         for _ in 0..descents {
@@ -259,13 +260,22 @@ impl Tree {
                 continue;
             }
 
-            // needs a network evaluation: queue it and mark the path as pending
-            let receiver = self.send_for_eval(&input_b, tensor_exe_send).await;
+            // needs a network evaluation: mark the path as pending
             self.add_virtual_visit(selected_node);
-            pending.push((selected_node, input_b, receiver));
+            pending.push((selected_node, input_b));
         }
 
-        for (selected_node, input_b, receiver) in pending {
+        // encode every leaf before sending any, so the packets arrive close enough together for
+        // the executor to evaluate them as one batch
+        let (packets, receivers): (Vec<_>, Vec<_>) = pending
+            .iter()
+            .map(|(_, input_b)| Self::eval_request(input_b))
+            .unzip();
+        for packet in packets {
+            tensor_exe_send.send_async(packet).await.unwrap();
+        }
+
+        for ((selected_node, input_b), receiver) in pending.into_iter().zip(receivers) {
             let idx_li = self
                 .receive_and_expand(selected_node, &input_b, receiver, cache)
                 .await;
@@ -595,13 +605,9 @@ impl Tree {
         (curr, input_b, (depth, max_depth))
     }
 
-    /// sends the input tensor of `bs` to `executor.rs` and returns the channel its result comes
+    /// builds the evaluation request of `bs` for `executor.rs` and the channel its result comes
     /// back on; `receive_and_expand` finishes the evaluation
-    async fn send_for_eval(
-        &self,
-        bs: &BoardStack,
-        tensor_exe_send: &Sender<Packet>,
-    ) -> Receiver<ReturnMessage> {
+    fn eval_request(bs: &BoardStack) -> (Packet, Receiver<ReturnMessage>) {
         debug_print!("    eval_and_expand:");
 
         let input_tensor = convert_board(bs);
@@ -613,8 +619,7 @@ impl Tree {
             id: generator_thread_name(),
         };
 
-        tensor_exe_send.send_async(pack).await.unwrap();
-        resender_recv
+        (pack, resender_recv)
     }
 
     /// waits for the network output of `bs` and calls `decoder.rs` to process it and expand

@@ -171,7 +171,7 @@ fn main() {
                 children_pst: 1.5,
             },
 
-            batch_size: 1,
+            batch_size: tzrust::mcts_trainer::VIRTUAL_LEAVES,
         };
 
         let mut tree = Tree::new(bs, settings);

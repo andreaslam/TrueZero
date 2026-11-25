@@ -65,7 +65,7 @@ fn main() {
             root_pst: 1.0,
             children_pst: 1.0,
         },
-        batch_size: 1,
+        batch_size: tzrust::mcts_trainer::VIRTUAL_LEAVES,
     };
     thread::scope(|s| {
         while games_count < target_games {

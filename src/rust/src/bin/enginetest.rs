@@ -36,7 +36,7 @@ fn main() {
     let (game_sender, game_receiver) = flume::bounded::<CollectorMessage>(1);
     let num_games = 1000000;
     let num_threads = 2048;
-    let engine_0: String = data_path_str("nets/tz_4.pt"); // new engine
+    let engine_0: String = data_path_str("tz_27.pt"); // new engine
     let engine_1: String = data_path_str("hidden/tz_163.pt"); // old engine
     let num_executors = 2; // always be 2, 2 players, one each (one for each neural net)
     let (ctrl_sender, ctrl_recv) = flume::bounded::<Message>(1);
@@ -157,7 +157,7 @@ async fn generator_main(
             root_pst: 1.75,
             children_pst: 1.5,
         },
-        batch_size: 1,
+        batch_size: tzrust::mcts_trainer::VIRTUAL_LEAVES,
     };
     let _thread_name = format!("tester-generator-{}", generator_id);
     debug_print!("{} Generator settings initialized", _thread_name);

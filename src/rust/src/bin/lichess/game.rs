@@ -288,7 +288,7 @@ impl Game<'_> {
                 root_pst: 1.75,
                 children_pst: 1.5,
             },
-            batch_size: 1,
+            batch_size: tzrust::mcts_trainer::VIRTUAL_LEAVES,
         };
 
         let (stop_send, stop_recv) = flume::bounded(1);

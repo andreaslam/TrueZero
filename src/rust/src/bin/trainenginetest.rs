@@ -13,7 +13,7 @@ use rand::seq::SliceRandom;
 use sha2::{Digest, Sha256};
 
 use std::{
-    collections::HashSet,
+    collections::{BTreeMap, HashSet},
     env,
     fs::{self, File},
     io::{self, BufRead, BufReader, Write},
@@ -49,13 +49,49 @@ use tzrust::{
 #[derive(Clone, Debug)]
 struct GamePair {
     test_id: usize,
+    // Position in dispatch order, 0..num_game_pairs.
+    pair_index: usize,
     fen: String,
 }
 
-// Outcome of one game, reported back to the collector.
+// Both games of a completed pair. Pairs are reported whole, so every counted
+// opening is played once with each colour.
+#[derive(Clone, Debug)]
+struct PairOutcome {
+    test_id: usize,
+    pair_index: usize,
+    games: [GameOutcome; 2],
+}
+
+// Releases pairs in dispatch order. Counting them as they finish would favour
+// short games whenever the sequential test stops early.
+struct InOrder<T> {
+    next: usize,
+    waiting: BTreeMap<usize, T>,
+}
+
+impl<T> InOrder<T> {
+    fn new() -> Self {
+        Self {
+            next: 0,
+            waiting: BTreeMap::new(),
+        }
+    }
+
+    fn insert(&mut self, index: usize, item: T) {
+        self.waiting.insert(index, item);
+    }
+
+    fn pop(&mut self) -> Option<T> {
+        let item = self.waiting.remove(&self.next)?;
+        self.next += 1;
+        Some(item)
+    }
+}
+
+// Outcome of one game of a pair.
 #[derive(Clone, Debug)]
 struct GameOutcome {
-    test_id: usize,
     engine0_white: bool,
 
     // None = draw
@@ -65,8 +101,6 @@ struct GameOutcome {
 }
 
 const NO_CANCELLED_TEST: usize = usize::MAX;
-
-const OVERDISPATCH_MULTIPLIER: usize = 2;
 
 const EARLY_REJECT_MIN_GAMES: usize = 100;
 
@@ -201,7 +235,7 @@ fn main() {
 
         let (job_send, job_recv) = flume::bounded::<GamePair>(num_workers);
 
-        let (result_send, result_recv) = flume::bounded::<GameOutcome>(num_workers);
+        let (result_send, result_recv) = flume::bounded::<PairOutcome>(num_workers);
 
         let cancelled_test = Arc::new(AtomicUsize::new(NO_CANCELLED_TEST));
 
@@ -342,7 +376,7 @@ fn read_epd_file(file_path: &str) -> io::Result<Vec<String>> {
 
 async fn worker_main(
     job_recv: Receiver<GamePair>,
-    result_send: Sender<GameOutcome>,
+    result_send: Sender<PairOutcome>,
     tensor_exe_send_0: Sender<Packet>,
     tensor_exe_send_1: Sender<Packet>,
     cancelled_test: Arc<AtomicUsize>,
@@ -384,7 +418,7 @@ async fn worker_main(
             children_pst: 1.5,
         },
 
-        batch_size: 1,
+        batch_size: tzrust::mcts_trainer::VIRTUAL_LEAVES,
     };
 
     let engines = [tensor_exe_send_0.clone(), tensor_exe_send_1.clone()];
@@ -398,7 +432,7 @@ async fn worker_main(
         // Game 1: candidate = White, benchmark = Black
         // ===============================================================
 
-        let outcome = play_game(
+        let Some(first) = play_game(
             &pair.fen,
             pair.test_id,
             true,
@@ -407,28 +441,17 @@ async fn worker_main(
             &cancelled_test,
             id,
         )
-        .await;
-
-        if let Some(outcome) = outcome {
-            debug_print!("worker-{} finished first game of pair: {:?}", id, outcome);
-
-            if result_send.send_async(outcome).await.is_err() {
-                return;
-            }
-        } else {
+        .await
+        else {
             // The test was cancelled during the first game.
             continue;
-        }
+        };
 
         // ===============================================================
         // Game 2: benchmark = White, candidate = Black
         // ===============================================================
 
-        if cancelled_test.load(Ordering::Acquire) == pair.test_id {
-            continue;
-        }
-
-        let outcome = play_game(
+        let Some(second) = play_game(
             &pair.fen,
             pair.test_id,
             false,
@@ -437,14 +460,26 @@ async fn worker_main(
             &cancelled_test,
             id,
         )
-        .await;
+        .await
+        else {
+            continue;
+        };
 
-        if let Some(outcome) = outcome {
-            debug_print!("worker-{} finished second game of pair: {:?}", id, outcome);
+        debug_print!(
+            "worker-{} finished pair: {:?} {:?}",
+            id,
+            first,
+            second
+        );
 
-            if result_send.send_async(outcome).await.is_err() {
-                return;
-            }
+        let outcome = PairOutcome {
+            test_id: pair.test_id,
+            pair_index: pair.pair_index,
+            games: [first, second],
+        };
+
+        if result_send.send_async(outcome).await.is_err() {
+            return;
         }
     }
 }
@@ -518,14 +553,13 @@ async fn play_game(
     let white_won: Option<bool> = bs.winner().map(|c| c == Color::White);
 
     Some(GameOutcome {
-        test_id,
         engine0_white,
         white_won,
     })
 }
 
 fn collector_main(
-    receiver: &Receiver<GameOutcome>,
+    receiver: &Receiver<PairOutcome>,
     mut server_handle: TcpStream,
     num_game_pairs: usize,
     cancelled_test: Arc<AtomicUsize>,
@@ -543,6 +577,8 @@ fn collector_main(
     let mut results = (0u32, 0u32, 0u32);
 
     let mut counter = 0usize;
+
+    let mut pairs: InOrder<[GameOutcome; 2]> = InOrder::new();
 
     let mut active_test_id: Option<usize> = None;
 
@@ -579,71 +615,67 @@ fn collector_main(
 
                 counter = 0;
 
+                pairs = InOrder::new();
+
                 println!("[sprt] Collecting results for test {}", msg.test_id);
             }
 
             _ => {}
         }
 
-        // ---------------------------------------------------------------
-        // Convert the result to the candidate's perspective.
-        //
-        // Draws are recorded but are NOT converted into half a win.
-        // ---------------------------------------------------------------
+        pairs.insert(msg.pair_index, msg.games);
 
-        match msg.white_won {
-            None => {
-                results.2 += 1;
-            }
+        let mut early_reject = false;
 
-            Some(white_won) => {
-                let engine0_won = white_won == msg.engine0_white;
-
-                if engine0_won {
-                    results.0 += 1;
-                } else {
-                    results.1 += 1;
+        while let Some(games) = pairs.pop() {
+            // Convert to the candidate's perspective. Draws are recorded but
+            // are NOT converted into half a win.
+            for game in games {
+                match game.white_won {
+                    None => results.2 += 1,
+                    Some(white_won) if white_won == game.engine0_white => results.0 += 1,
+                    Some(_) => results.1 += 1,
                 }
             }
+
+            counter += 2;
+
+            if counter % 50 == 0 {
+                let decisive = results.0 + results.1;
+
+                let decisive_win_rate = if decisive > 0 {
+                    results.0 as f64 / decisive as f64
+                } else {
+                    0.0
+                };
+
+                println!(
+                    "[sprt] progress {}/{} games  W:{} L:{} D:{} decisive:{} decisive-WR:{:.3}",
+                    counter,
+                    games_per_test,
+                    results.0,
+                    results.1,
+                    results.2,
+                    decisive,
+                    decisive_win_rate
+                );
+            }
+
+            // Sequential rejection, checked after each whole pair. Only
+            // decisive games contribute.
+            early_reject = should_early_reject(results.0, results.1);
+
+            if early_reject {
+                break;
+            }
         }
-
-        counter += 1;
-
-        if counter % 50 == 0 {
-            let decisive = results.0 + results.1;
-
-            let decisive_win_rate = if decisive > 0 {
-                results.0 as f64 / decisive as f64
-            } else {
-                0.0
-            };
-
-            println!(
-                "[sprt] progress {}/{} games  W:{} L:{} D:{} decisive:{} decisive-WR:{:.3}",
-                counter,
-                games_per_test,
-                results.0,
-                results.1,
-                results.2,
-                decisive,
-                decisive_win_rate
-            );
-        }
-
-        // ---------------------------------------------------------------
-        // Sequential rejection.
-        //
-        // Only decisive games contribute.
-        // ---------------------------------------------------------------
-
-        let early_reject = should_early_reject(results.0, results.1);
 
         // ---------------------------------------------------------------
         // Fixed-count completion.
         //
         // The fixed count is in TOTAL GAMES, including draws.
-        // This means a draw consumes one game of the test but contributes
-        // no evidence to the decisive-game SPRT.
+        // A draw consumes one game of the test but contributes no evidence
+        // to the decisive-game SPRT.
         // ---------------------------------------------------------------
 
         if early_reject || counter >= games_per_test {
@@ -976,14 +1008,11 @@ fn commander_main(
             // Drain any stale benchmark-ready signal.
             let _ = ready1.try_recv();
 
-            let total_pairs_dispatched = num_game_pairs * OVERDISPATCH_MULTIPLIER;
-
             println!(
-                "[sprt] Both engines ready. Dispatching test {}: {} counted game pairs, {} queued game pairs ({} queued games)",
+                "[sprt] Both engines ready. Dispatching test {}: {} game pairs ({} games)",
                 next_test_id,
                 num_game_pairs,
-                total_pairs_dispatched,
-                total_pairs_dispatched * 2
+                num_game_pairs * 2
             );
 
             let openings =
@@ -991,7 +1020,7 @@ fn commander_main(
 
             let mut rng = rand::thread_rng();
 
-            for _ in 0..total_pairs_dispatched {
+            for pair_index in 0..num_game_pairs {
                 let fen = openings.choose(&mut rng).unwrap().to_string();
 
                 // -------------------------------------------------------
@@ -1004,6 +1033,7 @@ fn commander_main(
                 job_send
                     .send(GamePair {
                         test_id: next_test_id,
+                        pair_index,
                         fen,
                     })
                     .unwrap();
@@ -1017,5 +1047,22 @@ fn commander_main(
         }
 
         recv_msg.clear();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pairs_are_released_in_dispatch_order() {
+        let mut pairs = InOrder::new();
+        pairs.insert(2, 'c');
+        pairs.insert(1, 'b');
+        assert_eq!(pairs.pop(), None);
+        pairs.insert(0, 'a');
+        let released: Vec<char> = std::iter::from_fn(|| pairs.pop()).collect();
+        assert_eq!(released, ['a', 'b', 'c']);
+        assert_eq!(pairs.pop(), None);
     }
 }

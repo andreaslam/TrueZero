@@ -215,7 +215,7 @@ async fn generator_main(
             root_pst: 1.5,
             children_pst: 1.5,
         },
-        batch_size: 1,
+        batch_size: tzrust::mcts_trainer::VIRTUAL_LEAVES,
     };
 
     let nps_sender = sender_collector.clone();

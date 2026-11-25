@@ -23,7 +23,16 @@ const STARTPOS: &str = "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1
 
 const DEFAULT_CACHE_SIZE: usize = 64; // default cache size in megabytes
 
-const DEFAULT_BATCH_SIZE: usize = 8;
+// The `Threads` option: leaves gathered per search step using virtual loss, evaluated together
+// as one network batch. 1 is plain sequential MCTS.
+const DEFAULT_THREADS: usize = 1;
+const MAX_THREADS: usize = 256;
+
+fn parse_threads(value: &str, current: usize) -> usize {
+    value
+        .parse::<usize>()
+        .map_or(current, |n| n.clamp(1, MAX_THREADS))
+}
 
 struct UCIRequest {
     board: BoardStack,
@@ -132,13 +141,12 @@ pub fn run_uci(net_path: &str) {
     let board = Board::default();
     let bs = BoardStack::new(board);
     let stack = Vec::new();
-    let _threads = 1;
 
     let net = Net::new(net_path);
     let (ctrl_sender, ctrl_recv) = flume::bounded::<Message>(1);
 
     let (cmd_send, cmd_recv) = flume::bounded::<UCIMsg>(1); // termination message
-    let (tensor_exe_send, tensor_exe_recv) = flume::bounded::<Packet>(1);
+    let (tensor_exe_send, tensor_exe_recv) = flume::bounded::<Packet>(MAX_THREADS);
 
     let (job_send, job_recv) = flume::bounded::<UCIRequest>(1);
 
@@ -158,7 +166,12 @@ pub fn run_uci(net_path: &str) {
         s.builder()
             .name("executor-uci".to_string())
             .spawn(move |_| {
-                executor_static(net_path.to_string(), tensor_exe_recv, ctrl_recv.clone(), 1)
+                executor_static(
+                    net_path.to_string(),
+                    tensor_exe_recv,
+                    ctrl_recv.clone(),
+                    MAX_THREADS,
+                )
             })
             .unwrap();
 
@@ -202,7 +215,7 @@ fn uci_command_parse_loop(
 ) {
     let mut cache_in_items = mb_to_items(DEFAULT_CACHE_SIZE); // cache size in number of items in `LruCache`
     let mut cache_reset = false;
-    let mut batch_size = DEFAULT_BATCH_SIZE;
+    let mut threads = DEFAULT_THREADS;
     loop {
         debug_print!("Debug: run_uci_loop ready");
         let input = user_input_recv.recv().unwrap();
@@ -233,7 +246,7 @@ fn uci_command_parse_loop(
                     &finished_move_recv,
                     cache_in_items,
                     cache_reset,
-                    batch_size,
+                    threads,
                 );
                 cache_reset = false;
             }
@@ -280,7 +293,7 @@ fn uci_command_parse_loop(
                     cache_in_items = mb_to_items(x.parse().unwrap_or(DEFAULT_CACHE_SIZE))
                 }
                 ["setoption", "name", "Threads", "value", x] => {
-                    batch_size = x.parse().unwrap_or(DEFAULT_BATCH_SIZE)
+                    threads = parse_threads(x, threads)
                 }
                 _ => {}
             },
@@ -324,7 +337,6 @@ fn listen_to_user_inputs(
 fn preamble() {
     println!("id name TrueZero-latest {}", env!("CARGO_PKG_VERSION"));
     println!("id author Andreas Lam");
-    println!("uciok");
     let cache_entry_size = get_cache_entry_size();
     println!(
         "option name Hash type spin default {} min 1 max {}",
@@ -333,9 +345,10 @@ fn preamble() {
     );
     println!(
         "option name Threads type spin default {} min 1 max {}",
-        DEFAULT_BATCH_SIZE,
-        i32::MAX
+        DEFAULT_THREADS,
+        MAX_THREADS
     );
+    println!("uciok");
 }
 
 fn check_castling_move_on_input(bs: &BoardStack, mut mv: Move) -> Move {
@@ -421,7 +434,7 @@ fn handle_go(
     finished_move_receiver: &Receiver<Move>,
     cache_size: usize,
     cache_reset: bool,
-    batch_size: usize,
+    threads: usize,
 ) {
     debug_print!("{}", &"Debug: Handling 'go' command".to_string());
 
@@ -539,7 +552,7 @@ fn handle_go(
             root_pst: 1.75,
             children_pst: 1.5,
         },
-        batch_size,
+        batch_size: threads,
     };
 
     let search_request = UCIRequest {
@@ -605,5 +618,18 @@ fn job_listener(job_receiver: Receiver<UCIRequest>, finished_move_sender: Sender
                 debug_print!("Error: Failed to receive message: {}", _msg);
             }
         };
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn threads_option_is_clamped_and_ignores_garbage() {
+        assert_eq!(parse_threads("16", 1), 16);
+        assert_eq!(parse_threads("0", 4), 1);
+        assert_eq!(parse_threads("100000", 4), MAX_THREADS);
+        assert_eq!(parse_threads("abc", 4), 4);
     }
 }

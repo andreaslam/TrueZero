@@ -98,7 +98,7 @@ fn main() {
             root_pst: 1.75,
             children_pst: 1.5,
         },
-        batch_size: 1,
+        batch_size: tzrust::mcts_trainer::VIRTUAL_LEAVES,
     };
     let (tensor_exe_send, tensor_exe_recv) = flume::bounded::<Packet>(1);
     let (ctrl_sender, ctrl_recv) = flume::bounded::<Message>(1);

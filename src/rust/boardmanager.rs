@@ -19,7 +19,7 @@ impl BoardStack {
     // get the number of previous occurrences of the current position
 
     pub fn get_reps(&self) -> usize {
-        let target = self.board.hash();
+        let target = repetition_hash(&self.board);
 
         self.move_stack
             .iter()
@@ -55,25 +55,11 @@ impl BoardStack {
             "Cannot play a move after the game has ended"
         );
 
-        self.move_stack.push(self.board.hash());
+        self.move_stack.push(repetition_hash(&self.board));
 
         self.board.play(mv);
 
-        let is_all_gone = self.board.occupied().len() == 2;
-
-        let is_sure_draw = self.board.occupied().len() <= 3
-            && (self.board.pieces(Piece::Bishop).len() == 1
-                || self.board.pieces(Piece::Knight).len() == 1);
-
-        self.status = if self.get_reps() == 2
-            || self.board.halfmove_clock() == 100
-            || is_all_gone
-            || is_sure_draw
-        {
-            GameStatus::Drawn
-        } else {
-            self.board.status()
-        };
+        self.status = self.status();
     }
 
     pub fn is_terminal(&self) -> bool {
@@ -103,12 +89,38 @@ impl BoardStack {
             && (self.board.pieces(Piece::Bishop).len() == 1
                 || self.board.pieces(Piece::Knight).len() == 1);
 
-        if self.get_reps() == 2 || self.board.halfmove_clock() == 100 || is_all_gone || is_sure_draw
-        {
+        // The 50-move rule is left to `Board::status`, which gives checkmate
+        // precedence when mate is delivered on the 100th halfmove.
+        if self.get_reps() == 2 || is_all_gone || is_sure_draw {
             GameStatus::Drawn
         } else {
             self.board.status()
         }
+    }
+}
+
+/// Hash identifying a position for repetition purposes.
+///
+/// `Board::hash` includes the en passant file after every double pawn push.
+/// FIDE only distinguishes positions by en passant when the capture is legal.
+fn repetition_hash(board: &Board) -> u64 {
+    let Some(file) = board.en_passant() else {
+        return board.hash();
+    };
+    let color = board.side_to_move();
+    let target = Square::new(file, Rank::Sixth.relative_to(color));
+    let can_capture = get_pawn_attacks(target, !color).into_iter().any(|from| {
+        board.piece_on(from) == Some(Piece::Pawn)
+            && board.is_legal(Move {
+                from,
+                to: target,
+                promotion: None,
+            })
+    });
+    if can_capture {
+        board.hash()
+    } else {
+        board.hash_without_ep()
     }
 }
 
@@ -122,5 +134,61 @@ pub fn engine_index(side_to_move: Color, engine0_white: bool) -> usize {
         0
     } else {
         1
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn play(fen: &str, moves: &[&str]) -> BoardStack {
+        let mut bs = BoardStack::new(fen.parse().unwrap());
+        for mv in moves {
+            bs.play(mv.parse().unwrap());
+        }
+        bs
+    }
+
+    #[test]
+    fn mate_on_hundredth_halfmove_wins() {
+        let bs = play("6k1/5ppp/8/8/8/8/8/R3K3 w - - 99 80", &["a1a8"]);
+        assert_eq!(bs.status(), GameStatus::Won);
+        assert_eq!(bs.winner(), Some(Color::White));
+    }
+
+    #[test]
+    fn quiet_hundredth_halfmove_draws() {
+        let bs = play("6k1/5ppp/8/8/8/8/8/R3K3 w - - 99 80", &["a1a7"]);
+        assert_eq!(bs.status(), GameStatus::Drawn);
+    }
+
+    const SHUFFLE: [&str; 4] = ["e8d8", "g1f3", "d8e8", "f3g1"];
+
+    #[test]
+    fn uncapturable_en_passant_does_not_hide_a_repetition() {
+        let mut moves = vec!["e2e4"];
+        moves.extend(SHUFFLE);
+        let fen = "4k3/8/8/8/8/8/4P3/4K1N1 w - - 0 1";
+        assert_eq!(play(fen, &moves).get_reps(), 1);
+        moves.extend(SHUFFLE);
+        assert_eq!(play(fen, &moves).status(), GameStatus::Drawn);
+    }
+
+    #[test]
+    fn legal_en_passant_is_a_different_position() {
+        let mut moves = vec!["e2e4"];
+        moves.extend(SHUFFLE);
+        let bs = play("4k3/8/8/8/3p4/8/4P3/4K1N1 w - - 0 1", &moves);
+        assert_eq!(bs.get_reps(), 0);
+    }
+
+    #[test]
+    fn pinned_en_passant_does_not_hide_a_repetition() {
+        // d4 is pinned to d8 by the rook, so dxe3 is never legal
+        let mut moves = vec!["e2e4"];
+        let shuffle = ["d8c8", "g1f3", "c8d8", "f3g1"];
+        moves.extend(shuffle);
+        let bs = play("3k4/8/8/8/3p4/8/4P3/3RK1N1 w - - 0 1", &moves);
+        assert_eq!(bs.get_reps(), 1);
     }
 }
