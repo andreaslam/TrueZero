@@ -3,6 +3,9 @@
 Modes:
   evolution  one frame per checkpoint in nets/ for a fixed FEN, stitched into a GIF
   play       the latest checkpoint plays itself (greedy policy); GIF + MP4 of the game
+  inspect    one checkpoint (--net, default the latest) and one FEN: a PNG per view of the
+             network's internals (inputs, trunk activations, policy and value heads,
+             saliency, weights); see netviews.py
 
 Boards are always drawn from White's point of view (rank 8 at the top), whichever
 side is to move, so frames stay comparable across a game. The network itself sees
@@ -27,6 +30,7 @@ import torch
 from PIL import Image
 
 from decoder import _flip_rank, convert_board, decode_nn_output
+from netviews import all_figures, to_display_grid
 from network import TrueNet
 from paths import data_dir, data_path
 
@@ -65,16 +69,6 @@ def to_physical_move(uci, board):
     return chess.Move(
         _flip_rank(mv.from_square), _flip_rank(mv.to_square), promotion=mv.promotion
     ).uci()
-
-
-def to_display_grid(plane, board):
-    """Orient an 8x8 activation plane (row = canonical rank) as White sees the board.
-
-    Row r of the input is rank r for White to move and rank 7-r for Black to move
-    (the encoder rank-flips for Black). imshow puts row 0 at the top, so flip White's
-    planes to get rank 8 at the top; Black's are already in that order.
-    """
-    return np.flipud(plane) if board.turn == chess.WHITE else plane
 
 
 def fig_to_rgb(fig):
@@ -238,7 +232,7 @@ def main():
     parser = argparse.ArgumentParser(
         description="Chess Visualisation with Neural Networks"
     )
-    parser.add_argument("--mode", choices=["evolution", "play"], required=True)
+    parser.add_argument("--mode", choices=["evolution", "play", "inspect"], required=True)
     parser.add_argument(
         "--nets_dir", default="nets", help="Directory containing neural network models"
     )
@@ -249,6 +243,9 @@ def main():
         "--fen",
         default="rnbqkbnr/pppp1p1p/6p1/4p2Q/4P3/8/PPPP1PPP/RNB1KBNR w KQkq - 0 3",
         help="FEN string for chess board",
+    )
+    parser.add_argument(
+        "--net", help="inspect mode: checkpoint path (default: latest in --nets_dir)"
     )
     parser.add_argument("--video_name", default="chess_game.mp4")
     parser.add_argument("--gif_name", default="chess_game.gif")
@@ -268,10 +265,22 @@ def main():
         ),
         key=extract_number_tz,
     )
-    if not all_nets:
+    if not all_nets and not args.net:
         raise SystemExit(f"no tz_<n>.pt checkpoints in {nets_dir}")
 
-    if args.mode == "evolution":
+    if args.mode == "inspect":
+        net_path = args.net or all_nets[-1]
+        net_name = os.path.splitext(os.path.basename(net_path))[0]
+        out = data_dir(os.path.join(args.output_dir, f"inspect_{net_name}"))
+        net = build_net_from_checkpoint(net_path, torch.device("cpu"))
+        plt.style.use("dark_background")
+        for name, fig in all_figures(net, chess.Board(args.fen), f"TrueZero {net_name}"):
+            path = os.path.join(out, f"{name}.png")
+            fig.savefig(path, dpi=110)
+            plt.close(fig)
+            print(f"wrote {path}")
+
+    elif args.mode == "evolution":
         max_pol = max(ChessVisualiser(net).max_policy(args.fen) for net in all_nets)
         pool_args = [
             (net, max_pol, args.fen, output_dir, i) for i, net in enumerate(all_nets)

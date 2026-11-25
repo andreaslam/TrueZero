@@ -197,7 +197,7 @@ The optional argument is the network file, resolved relative to the project root
 - `onnx_exporter.py` - contains code to convert `.pt` model weights to `.onnx`
 - `scheduler.py` - code for TrueScheduler, an experiment scheduler for scheduling experiments and monitoring server controls. This GUI also supports remote SSH logins to schedule experiments on external devices. 
 - `visualiser.py` - visualises training data and monitoring key performance indicators logged in `client.py`, where code from `lib/plotter.py`. For more details on the `lib` folder see [here](https://github.com/andreaslam/TrueZero?tab=readme-ov-file#credits-and-acknowledgements).
-- `visualisenet.py` - code that allows visualisation of neural network activations. Generates a `.gif` file for an animation of a policy-only game.
+- `visualisenet.py` - code that allows visualisation of neural network activations. Generates a `.gif` file for an animation of a policy-only game. `--mode inspect --fen "<FEN>" [--net nets/tz_N.pt]` writes a PNG per view of one checkpoint's internals for one position (input planes, per-block activation maps, policy-head planes over the board, value/WDL/moves-left, saliency and piece-removal values, filter weights); the views live in `netviews.py`.
 
 ## Libraries/technologies used 
 This Python and Rust Engine uses the following:
