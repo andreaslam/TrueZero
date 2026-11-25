@@ -9,11 +9,42 @@ use cozy_chess::{Color, File, Move, Piece, Square};
 use lru::LruCache;
 use tch::{Device, IValue, Kind, Tensor};
 
+/// Number of rows to run on MPS for a batch of `n` positions: the next power of two up to
+/// 128, then the next multiple of 128.
+///
+/// MPSGraph compiles and caches a graph for every distinct input shape. Self-play batches
+/// rarely repeat a size, so unpadded batches never stop compiling and throughput decays.
+fn mps_batch_size(n: i64) -> i64 {
+    if n <= 128 {
+        (n.max(1) as u64).next_power_of_two() as i64
+    } else {
+        (n + 127) / 128 * 128
+    }
+}
+
+/// Appends zero rows to `b` (`[n, 21, 8, 8]`) up to `mps_batch_size(n)` rows.
+fn pad_batch_for_mps(b: Tensor) -> Tensor {
+    let n = b.size()[0];
+    let padding = mps_batch_size(n) - n;
+    if padding == 0 {
+        return b;
+    }
+    let zeros = Tensor::zeros([padding, 21, 8, 8], (b.kind(), b.device()));
+    Tensor::cat(&[b, zeros], 0)
+}
+
 pub fn eval_state(board: Tensor, net: &Net) -> anyhow::Result<(Tensor, Tensor)> {
     // miracle mps fix???
     let _no_grad = tch::no_grad_guard();
 
     let b = board.reshape([-1, 21, 8, 8]);
+    let batch_size = b.size()[0];
+    let b = if net.device == Device::Mps {
+        pad_batch_for_mps(b)
+    } else {
+        b
+    };
+    let padded_batch_size = b.size()[0];
     let b = b.to(net.device);
     let board = IValue::Tensor(b);
 
@@ -41,7 +72,22 @@ pub fn eval_state(board: Tensor, net: &Net) -> anyhow::Result<(Tensor, Tensor)> 
 
     drop(output_tensor);
 
-    Ok((board_eval, policy))
+    if padded_batch_size == batch_size {
+        return Ok((board_eval, policy));
+    }
+
+    // Drop the padding rows. Slicing the CPU copies keeps the output shapes MPS sees fixed too.
+    for output in [&board_eval, &policy] {
+        anyhow::ensure!(
+            output.size().first() == Some(&padded_batch_size),
+            "expected {padded_batch_size} output rows, got shape {:?}",
+            output.size()
+        );
+    }
+    Ok((
+        board_eval.narrow(0, 0, batch_size),
+        policy.narrow(0, 0, batch_size),
+    ))
 }
 
 
@@ -368,4 +414,148 @@ pub fn process_board_output(
     );
 
     idx_li
+}
+
+#[cfg(test)]
+mod mps_padding_tests {
+    use super::*;
+    use std::collections::BTreeSet;
+    use tch::{utils::has_mps, CModule};
+
+    const MAX_BATCH: i64 = 2048;
+
+    /// Sizes around every power of two, every multiple of 128, and the usual self-play size.
+    fn boundary_sizes() -> BTreeSet<i64> {
+        let mut sizes = BTreeSet::from([1, 1365]);
+        let powers = (0..=7).map(|e| 1 << e);
+        let multiples = (1..=MAX_BATCH / 128).map(|k| k * 128);
+        for edge in powers.chain(multiples) {
+            sizes.extend((edge - 1..=edge + 1).filter(|n| (1..=MAX_BATCH).contains(n)));
+        }
+        sizes
+    }
+
+    #[test]
+    fn bucket_boundaries() {
+        for (n, expected) in [
+            (1, 1),
+            (2, 2),
+            (3, 4),
+            (4, 4),
+            (5, 8),
+            (63, 64),
+            (64, 64),
+            (65, 128),
+            (127, 128),
+            (128, 128),
+            (129, 256),
+            (255, 256),
+            (256, 256),
+            (257, 384),
+            (1365, 1408),
+            (1408, 1408),
+            (1409, 1536),
+            (2047, 2048),
+            (2048, 2048),
+        ] {
+            assert_eq!(mps_batch_size(n), expected, "n = {n}");
+        }
+    }
+
+    #[test]
+    fn buckets_cover_every_batch_with_few_shapes() {
+        let mut shapes = BTreeSet::new();
+        for n in 1..=MAX_BATCH {
+            let size = mps_batch_size(n);
+            assert!(size >= n, "n = {n} would lose rows");
+            assert_eq!(mps_batch_size(size), size, "n = {n} is not stable");
+            shapes.insert(size);
+        }
+        assert_eq!(shapes.len(), 23);
+    }
+
+    #[test]
+    fn padding_keeps_the_rows_and_adds_zeros() {
+        for n in [1, 3, 127, 128, 129, 1365] {
+            let b = Tensor::rand([n, 21, 8, 8], (Kind::Float, Device::Cpu));
+            let padded = pad_batch_for_mps(b.shallow_clone());
+            let size = mps_batch_size(n);
+            assert_eq!(padded.size(), [size, 21, 8, 8]);
+            assert!(padded.narrow(0, 0, n).equal(&b));
+            let rest = padded.narrow(0, n, size - n);
+            assert_eq!(rest.count_nonzero(None::<i64>).int64_value(&[]), 0);
+        }
+    }
+
+    /// Any net from `network.py`, e.g. from src/python:
+    ///   python -c "import torch, network; torch.jit.save(torch.jit.script(network.TrueNetXS(num_resBlocks=1, num_hidden=8)).eval(), '/tmp/tz_e2e.pt')"
+    /// then, from src/rust: cargo test --lib -- --ignored mps_padding
+    const NET: &str = "/tmp/tz_e2e.pt";
+
+    fn load(device: Device) -> Net {
+        let mut net = CModule::load_on_device(NET, device).unwrap();
+        net.set_eval();
+        Net { net, device }
+    }
+
+    /// The network's own outputs for `board`, without `eval_state`.
+    fn raw_outputs(board: &Tensor, net: &Net) -> Vec<Tensor> {
+        let _no_grad = tch::no_grad_guard();
+        let input = board.reshape([-1, 21, 8, 8]).to(net.device);
+        match net.net.forward_is(&[IValue::Tensor(input)]).unwrap() {
+            IValue::Tuple(outputs) => outputs
+                .into_iter()
+                .map(|output| match output {
+                    IValue::Tensor(t) => t.to(Device::Cpu),
+                    other => panic!("not a tensor: {other:?}"),
+                })
+                .collect(),
+            other => panic!("not a tuple: {other:?}"),
+        }
+    }
+
+    /// Largest difference over both outputs, relative to the output's scale. Also checks that
+    /// `eval_state` returns one row per position in every output.
+    fn max_difference(net: &Net, n: i64) -> f64 {
+        let board = Tensor::rand([n * 21 * 64], (Kind::Float, Device::Cpu));
+        let raw = raw_outputs(&board, net);
+        let (board_eval, policy) = eval_state(board, net).unwrap();
+        assert_eq!(board_eval.size(), [n, 5]);
+        assert_eq!(policy.size(), [n, 1880]);
+        [board_eval, policy]
+            .iter()
+            .zip(&raw)
+            .map(|(ours, raw)| {
+                let difference = (ours - raw).abs().max().double_value(&[]);
+                difference / raw.abs().max().double_value(&[])
+            })
+            .fold(0.0, f64::max)
+    }
+
+    /// In training mode batch norm mixes rows, so any padding would change the outputs.
+    #[test]
+    #[ignore]
+    fn mps_padding_is_not_applied_on_cpu() {
+        let mut net = load(Device::Cpu);
+        net.net.set_train();
+        for n in [2, 3, 127, 128, 129, 1365] {
+            assert_eq!(max_difference(&net, n), 0.0, "n = {n}");
+        }
+    }
+
+    #[test]
+    #[ignore]
+    fn mps_padding_does_not_change_the_outputs() {
+        assert!(has_mps(), "needs an MPS device");
+        let mut net = load(Device::Mps);
+        for n in boundary_sizes() {
+            let difference = max_difference(&net, n);
+            assert!(difference < 1e-5, "n = {n}: {difference:e}");
+        }
+
+        // control: the comparison must notice padding when rows do influence each other
+        net.net.set_train();
+        assert!(max_difference(&net, 128) < 1e-5);
+        assert!(max_difference(&net, 129) > 1e-3);
+    }
 }
