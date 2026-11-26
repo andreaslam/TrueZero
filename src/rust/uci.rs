@@ -8,7 +8,7 @@ use crate::{
     decoder::{convert_board, eval_state, extract_policy},
     executor::{executor_static, Message, Packet},
     mcts::get_move,
-    mcts_trainer::{EvalMode, Net, TypeRequest::UCISearch},
+    mcts_trainer::{EvalMode, Net, NetSource, TypeRequest::UCISearch},
     mvs::get_contents,
     settings::SearchSettings,
 };
@@ -132,7 +132,7 @@ pub fn go_visit_limit(
     }
 }
 
-pub fn run_uci(net_path: &str) {
+pub fn run_uci(net_source: NetSource) {
     panic::set_hook(Box::new(|panic_info| {
         eprintln!("Panic occurred: {}", panic_info);
         std::process::exit(1);
@@ -142,7 +142,7 @@ pub fn run_uci(net_path: &str) {
     let bs = BoardStack::new(board);
     let stack = Vec::new();
 
-    let net = Net::new(net_path);
+    let net = Net::load(&net_source, None);
     let (ctrl_sender, ctrl_recv) = flume::bounded::<Message>(1);
 
     let (cmd_send, cmd_recv) = flume::bounded::<UCIMsg>(1); // termination message
@@ -167,7 +167,7 @@ pub fn run_uci(net_path: &str) {
             .name("executor-uci".to_string())
             .spawn(move |_| {
                 executor_static(
-                    net_path.to_string(),
+                    net_source,
                     tensor_exe_recv,
                     ctrl_recv.clone(),
                     MAX_THREADS,

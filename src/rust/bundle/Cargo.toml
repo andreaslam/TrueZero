@@ -1,0 +1,21 @@
+[package]
+name = "tzbundle"
+version = "0.1.0"
+edition = "2021"
+description = "Single-file launcher: embeds a tzrust binary and its libtorch libraries"
+publish = false
+
+# Standalone package: built by ../bundle.sh, not part of the tzrust package.
+[workspace]
+
+[dependencies]
+tar = "0.4"
+zstd = "0.13"
+
+[build-dependencies]
+tar = "0.4"
+zstd = { version = "0.13", features = ["zstdmt"] }
+sha2 = "0.10"
+
+[profile.release]
+strip = true

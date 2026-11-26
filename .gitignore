@@ -54,3 +54,6 @@ env/
 *.log
 
 INVARIANTS.md
+
+# --- Self-contained binaries (src/rust/bundle.sh) ---
+/dist/

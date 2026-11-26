@@ -64,4 +64,4 @@ required-environments = [
 
 [tool.maturin]
 manifest-path = "src/rust/Cargo.toml"
-features = ["pyo3/extension-module"]
+features = ["python", "pyo3/extension-module"]

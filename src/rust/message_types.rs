@@ -1,21 +1,29 @@
+#[cfg(feature = "python")]
 use pyo3::prelude::*;
 use serde::{Deserialize, Serialize};
 
-#[pyclass]
+#[cfg_attr(feature = "python", pyclass)]
 #[derive(Serialize, Deserialize, Debug, PartialEq, Clone)]
 pub struct MessageServer {
     pub purpose: MessageType,
 }
 
-#[pymethods]
 impl MessageServer {
-    #[new]
     pub fn new(purpose: MessageType) -> Self {
         MessageServer { purpose }
     }
 }
 
-#[pyclass]
+#[cfg(feature = "python")]
+#[pymethods]
+impl MessageServer {
+    #[new]
+    fn py_new(purpose: MessageType) -> Self {
+        Self::new(purpose)
+    }
+}
+
+#[cfg_attr(feature = "python", pyclass)]
 #[derive(Serialize, Deserialize, Debug, PartialEq, Clone)]
 pub enum MessageType {
     Initialise(Entity),
@@ -33,14 +41,14 @@ pub enum MessageType {
     EvaluationRequest(ExternalPacket), // use Vec<f32> to handle raw input data
 }
 
-#[pyclass]
+#[cfg_attr(feature = "python", pyclass)]
 #[derive(Serialize, Deserialize, Debug, PartialEq, Clone)]
 pub struct GateTesterResult {
     pub elo: (f64, f64, f64),
     pub accept_new_net: bool,
 }
 
-#[pyclass]
+#[cfg_attr(feature = "python", pyclass)]
 #[derive(Serialize, Deserialize, Debug, PartialEq, Clone)]
 pub struct ExternalPacket {
     pub data: Vec<f32>,
@@ -48,7 +56,7 @@ pub struct ExternalPacket {
     pub mcts_id: usize,
 }
 
-#[pyclass]
+#[cfg_attr(feature = "python", pyclass)]
 #[derive(Serialize, Deserialize, Debug, PartialEq, Clone)]
 pub enum DataFileType {
     OffFile(Vec<u8>),
@@ -56,7 +64,7 @@ pub enum DataFileType {
     BinFile(Vec<u8>),
 }
 
-#[pyclass(eq, eq_int)]
+#[cfg_attr(feature = "python", pyclass(eq, eq_int))]
 #[derive(Serialize, Deserialize, Debug, PartialEq, Clone, Eq)]
 pub enum Entity {
     RustDataGen,
@@ -66,13 +74,14 @@ pub enum Entity {
     GateTesterRunner,
 }
 
-#[pyclass]
+#[cfg_attr(feature = "python", pyclass)]
 #[derive(Serialize, Deserialize, Debug, PartialEq, Clone)]
 pub enum Statistics {
     NodesPerSecond(usize),
     EvalsPerSecond(usize),
 }
 
+#[cfg(feature = "python")]
 #[pymodule]
 #[pyo3(name = "tzrust")]
 fn tzrust(m: &Bound<'_, PyModule>) -> PyResult<()> {

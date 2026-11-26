@@ -152,7 +152,17 @@ cd src/rust
 cargo run --bin ucimain --release -- nets/tz_42.pt
 ```
 
-The optional argument is the network file, resolved relative to the project root; an absolute path also works. Without it, the engine uses `nets/tz_0.pt`. The compiled binaries (in `src/rust/target/release/`) can also be launched directly from any directory.
+The optional argument is the network file: a path that exists as given (absolute or relative to the current directory) is used directly, otherwise it is resolved relative to the project root. Without it, the engine uses the network compiled into the binary, chosen at build time with `TZ_DEFAULT_NET` (default `tz_36.pt` at the project root; if that file is missing, the build warns and `ucimain` then requires the argument). The compiled binaries (in `src/rust/target/release/`) find libtorch through their rpath, so they can be launched directly from any directory without setting library paths.
+
+### Self-contained executables
+
+To get a single file that runs on a machine with no libtorch, Python or network files (same OS and CPU architecture):
+
+```
+src/rust/bundle.sh            # ucimain; or list binaries: src/rust/bundle.sh ucimain getmove
+```
+
+This writes `dist/ucimain`. It embeds the binary, its default network and the libtorch libraries (compressed, ~31 MB on macOS CPU/MPS; a CUDA libtorch on Linux is much larger). On first run it unpacks them into a per-version cache directory (`~/Library/Caches/truezero`, `~/.cache/truezero`, or `$TZ_BUNDLE_CACHE`), which takes a couple of seconds; later runs start immediately.
 
 ## Internal Engine testing (non-UCI compliant)
 - `getdecode.rs` - used for obtaining the encoded NN inputs.

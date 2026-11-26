@@ -89,14 +89,30 @@ fn requested_device(id: Option<usize>) -> Device {
 impl Net {
     /// creates a new `Net` instance by loading a model from the specified path
     pub fn new(path: &str) -> Self {
-        let device = requested_device(None);
-        let mut net = tch::CModule::load_on_device(path, device).expect("ERROR");
-        net.set_eval();
-
-        Self { net, device }
+        Self::load(&NetSource::Path(path.to_string()), None)
     }
     /// creates a new `Net` instance with a specified device ID (supports only CUDA)
     pub fn new_with_device_id(path: &str, id: usize) -> Self {
+        Self::load(&NetSource::Path(path.to_string()), Some(id))
+    }
+    /// loads a `Net` from a file or from bytes compiled into the binary.
+    /// `id` selects the CUDA device (`None` for the default device).
+    pub fn load(source: &NetSource, id: Option<usize>) -> Self {
+        let device = Self::device_for(id);
+        let mut net = match source {
+            NetSource::Path(path) => tch::CModule::load_on_device(path, device),
+            NetSource::Embedded(bytes) => {
+                tch::CModule::load_data_on_device(&mut std::io::Cursor::new(*bytes), device)
+            }
+        }
+        .unwrap_or_else(|e| panic!("failed to load network {source}: {e}"));
+        net.set_eval();
+        Self { net, device }
+    }
+    fn device_for(id: Option<usize>) -> Device {
+        let Some(id) = id else {
+            return requested_device(None);
+        };
         let device = requested_device(Some(id));
         let device = if let Device::Cuda(device_id) = device {
             let id = if Cuda::device_count() <= (device_id as i64) {
@@ -108,10 +124,36 @@ impl Net {
         } else {
             device
         };
-        // let device = Device::Cpu;
-        let mut net = tch::CModule::load_on_device(path, device).expect("ERROR");
-        net.set_eval();
-        Self { net, device }
+        device
+    }
+}
+
+/// Where a network comes from: a TorchScript file on disk, or one compiled into the
+/// binary with `include_bytes!` (see `ucimain`), so the binary needs no net file.
+#[derive(Clone, Debug)]
+pub enum NetSource {
+    Path(String),
+    Embedded(&'static [u8]),
+}
+
+impl From<String> for NetSource {
+    fn from(path: String) -> Self {
+        NetSource::Path(path)
+    }
+}
+
+impl From<&str> for NetSource {
+    fn from(path: &str) -> Self {
+        NetSource::Path(path.to_string())
+    }
+}
+
+impl std::fmt::Display for NetSource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            NetSource::Path(path) => write!(f, "{path}"),
+            NetSource::Embedded(bytes) => write!(f, "<embedded, {} bytes>", bytes.len()),
+        }
     }
 }
 

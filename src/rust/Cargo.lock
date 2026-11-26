@@ -2448,6 +2448,7 @@ dependencies = [
  "sha2 0.10.9",
  "tch",
  "tokio",
+ "torch-sys",
 ]
 
 [[package]]

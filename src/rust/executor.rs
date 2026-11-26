@@ -1,5 +1,7 @@
 use crate::{
-    debug_print, decoder::eval_state, mcts_trainer::Net, selfplay::CollectorMessage,
+    debug_print,
+    decoder::eval_state,
+    mcts_trainer::{Net, NetSource}, selfplay::CollectorMessage,
     utils::TimeStampDebugger,
 };
 
@@ -49,7 +51,7 @@ pub enum ReturnMessage {
 
 fn handle_new_graph(
     network: &mut Option<Net>,
-    graph: Option<String>,
+    graph: Option<NetSource>,
     _thread_name: &str,
     id: usize,
 ) {
@@ -59,7 +61,7 @@ fn handle_new_graph(
         drop(network)
     }
 
-    *network = graph.map(|graph| Net::new_with_device_id(&graph[..], id));
+    *network = graph.map(|graph| Net::load(&graph, Some(id)));
 }
 
 fn handle_requests(
@@ -164,7 +166,7 @@ pub fn executor_main(
             match message {
                 Message::StopServer => break,
                 Message::NewNetwork(Ok(graph)) => {
-                    handle_new_graph(&mut network, Some(graph), &thread_name, executor_id);
+                    handle_new_graph(&mut network, Some(graph.into()), &thread_name, executor_id);
                     match executor_ready_sender {
                         Some(ref sender) => sender.send(true).unwrap(),
                         None => {}
@@ -237,7 +239,7 @@ pub fn executor_main(
 }
 
 pub fn executor_static(
-    net_path: String,
+    net_path: impl Into<NetSource>,
     tensor_receiver: Receiver<Packet>, // receive tensors from mcts
     ctrl_receiver: Receiver<Message>,  // receive control messages
     num_threads: usize,
@@ -251,7 +253,7 @@ pub fn executor_static(
 
     let (handler_send, handler_recv) = flume::bounded::<ExecutorPacket>(1);
 
-    handle_new_graph(&mut network, Some(net_path), thread_name.as_str(), 0); // TODO maybe pass an option to use either/both GPUs? and not hardcode static GPU to 1 GPU only?
+    handle_new_graph(&mut network, Some(net_path.into()), thread_name.as_str(), 0); // TODO maybe pass an option to use either/both GPUs? and not hardcode static GPU to 1 GPU only?
 
     let _ = thread::scope(|s| {
         s.builder()
